@@ -37,7 +37,7 @@ class HorseRacingPredictor:
         
     def create_synthetic_labels(self, df, method="odds_based"):
         """Crée des labels synthétiques adaptés au nombre de partants"""
-        labels = pd.Series(0, index=df.index)
+        labels = pd.Series(0, index=df.index, dtype=int)  # Spécifier le type
         n_runners = len(df)
         
         if method == "odds_based":
@@ -77,10 +77,10 @@ class HorseRacingPredictor:
         features_df = df.copy()
         n_runners = len(df)
         
-        # Features de base
+        # Features de base avec gestion de type robuste
         features_df['odds_reciprocal'] = 1 / features_df['odds_numeric']
         features_df['odds_log'] = np.log(features_df['odds_numeric'])
-        features_df['odds_rank'] = features_df['odds_numeric'].rank()
+        features_df['odds_rank'] = features_df['odds_numeric'].rank().astype(float)
         
         # Features de position relative ADAPTATIVES
         features_df['draw_position_ratio'] = features_df['draw_numeric'] / n_runners
@@ -94,6 +94,10 @@ class HorseRacingPredictor:
         
         # Features de poids (avec gestion des valeurs manquantes)
         if 'weight_kg' in df.columns:
+            # S'assurer que weight_kg est numérique
+            features_df['weight_kg'] = pd.to_numeric(features_df['weight_kg'], errors='coerce')
+            features_df['weight_kg'] = features_df['weight_kg'].fillna(features_df['weight_kg'].mean() if not features_df['weight_kg'].isna().all() else 60.0)
+            
             features_df['weight_deviation'] = (features_df['weight_kg'] - features_df['weight_kg'].mean()) / features_df['weight_kg'].std()
             features_df['is_light_weight'] = (features_df['weight_kg'] < features_df['weight_kg'].quantile(0.3)).astype(int)
         else:
@@ -112,6 +116,11 @@ class HorseRacingPredictor:
         features_df['odds_runners_interaction'] = features_df['odds_reciprocal'] * (1 / n_runners)
         features_df['draw_runners_interaction'] = features_df['draw_numeric'] / n_runners
         
+        # Conversion de toutes les colonnes en float pour éviter les problèmes de type
+        for col in features_df.columns:
+            features_df[col] = pd.to_numeric(features_df[col], errors='coerce')
+            features_df[col] = features_df[col].fillna(0.0)
+        
         # Sélection des features finales
         exclude_cols = ['Nom', 'Cote', 'Numéro de corde', 'Poids', 'Musique', 'Âge/Sexe', 'Jockey', 'Entraîneur', 'weight_kg']
         feature_columns = [col for col in features_df.columns if col not in exclude_cols]
@@ -120,7 +129,7 @@ class HorseRacingPredictor:
     
     def _parse_musique_score(self, musique):
         """Convertit la musique en score numérique"""
-        if pd.isna(musique):
+        if pd.isna(musique) or musique == '':
             return 0.5
         try:
             positions = []
@@ -138,6 +147,10 @@ class HorseRacingPredictor:
         """Entraîne le modèle avec validation adaptative"""
         if len(features) < 6:
             raise ValueError("Nombre insuffisant de partants pour l'entraînement ML")
+        
+        # S'assurer que les features sont numériques
+        features = features.astype(float)
+        labels = labels.astype(int)
             
         X_train, X_test, y_train, y_test = train_test_split(
             features, labels, 
@@ -145,6 +158,10 @@ class HorseRacingPredictor:
             random_state=ML_CONFIG["random_state"],
             stratify=labels if len(np.unique(labels)) > 1 else None
         )
+        
+        # Vérifier qu'il y a au moins 2 classes
+        if len(np.unique(y_train)) < 2:
+            raise ValueError("Données d'entraînement insuffisantes (une seule classe)")
         
         # Normalisation des features
         X_train_scaled = self.scaler.fit_transform(X_train)
@@ -168,12 +185,13 @@ class HorseRacingPredictor:
                 max_depth=max_depth
             )
         elif model_type == "xgboost":
+            scale_pos_weight = len(y_train[y_train==0]) / len(y_train[y_train==1]) if sum(y_train) > 0 else 1
             self.model = xgb.XGBClassifier(
                 n_estimators=n_estimators,
                 random_state=ML_CONFIG["random_state"],
                 max_depth=max_depth,
                 learning_rate=0.1,
-                scale_pos_weight=len(y_train[y_train==0]) / len(y_train[y_train==1]) if sum(y_train) > 0 else 1
+                scale_pos_weight=scale_pos_weight
             )
         elif model_type == "gradient_boosting":
             self.model = GradientBoostingClassifier(
@@ -217,6 +235,8 @@ class HorseRacingPredictor:
         if self.model is None:
             raise ValueError("Le modèle doit être entraîné avant de faire des prédictions")
         
+        # S'assurer que les features sont numériques
+        features = features.astype(float)
         features_scaled = self.scaler.transform(features)
         probabilities = self.model.predict_proba(features_scaled)[:, 1]
         
@@ -229,13 +249,13 @@ class HorseRacingPredictor:
         """Calibre les probabilités selon le nombre de partants"""
         probabilities = np.clip(probabilities, 0.01, 0.99)
         
-        if n_runners > 1:
+        if n_runners > 1 and probabilities.sum() > 0:
             target_sum = min(n_runners * 0.15, 0.95)
             probabilities = probabilities / probabilities.sum() * target_sum
             
         return probabilities
 
-# ==== FONCTIONS AMÉLIORÉES POUR L'EXTRACTION DES DONNÉES ====
+# ==== FONCTIONS AMÉLIORÉES POUR L'EXTRACTION ET PRÉPARATION ====
 def extract_race_data(url):
     """Fonction robuste d'extraction des données hippiques"""
     try:
@@ -281,7 +301,6 @@ def extract_race_data(url):
 def extract_horse_data_from_row(cols):
     """Extrait les données d'un cheval depuis une ligne de tableau"""
     try:
-        # Mapping flexible des colonnes
         cheval_data = {}
         
         for i, col in enumerate(cols):
@@ -321,7 +340,7 @@ def extract_horse_data_from_row(cols):
 def extract_from_divs(soup):
     """Extraction depuis des divs (fallback)"""
     donnees_chevaux = []
-    # Implémentation basique - à adapter selon le site
+    # Recherche de divs contenant des données de chevaux
     horse_divs = soup.find_all('div', class_=re.compile(r'horse|cheval|runner', re.I))
     
     for div in horse_divs:
@@ -414,7 +433,7 @@ def parse_horses_from_json(horses_data):
     return donnees_chevaux
 
 def prepare_features_ml(df, predictor):
-    """Préparation robuste des données avec gestion des colonnes manquantes"""
+    """Préparation robuste des données avec gestion des types"""
     print("\n🔧 PRÉPARATION DES DONNÉES...")
     
     # Vérification des colonnes critiques
@@ -424,23 +443,27 @@ def prepare_features_ml(df, predictor):
     if missing_columns:
         raise ValueError(f"Colonnes manquantes: {missing_columns}")
     
-    # Conversions sécurisées
+    # Conversions sécurisées avec gestion de type
     df['odds_numeric'] = df['Cote'].apply(safe_float_convert)
     df['draw_numeric'] = df['Numéro de corde'].apply(safe_int_convert)
     
-    # Gestion du poids avec fallback
+    # Gestion robuste du poids
     if 'Poids' in df.columns:
         df['weight_kg'] = df['Poids'].apply(extract_weight_kg)
         # Remplissage des valeurs manquantes
         if df['weight_kg'].isna().any():
             weight_mean = df['weight_kg'].mean()
             if pd.isna(weight_mean):
-                weight_mean = 60.0  # Valeur par défaut
+                weight_mean = 60.0
             df['weight_kg'] = df['weight_kg'].fillna(weight_mean)
     else:
-        # Création d'une colonne poids par défaut
         df['weight_kg'] = 60.0
         print("⚠️ Colonne 'Poids' non trouvée, utilisation de valeurs par défaut")
+    
+    # Conversion explicite des types
+    df['odds_numeric'] = pd.to_numeric(df['odds_numeric'], errors='coerce')
+    df['draw_numeric'] = pd.to_numeric(df['draw_numeric'], errors='coerce')
+    df['weight_kg'] = pd.to_numeric(df['weight_kg'], errors='coerce')
     
     # Nettoyage des données critiques
     initial_count = len(df)
@@ -473,23 +496,21 @@ def analyze_race_adaptive(df, race_type="AUTO"):
             "w_odds": 0.5, "w_draw": 0.3, "w_weight": 0.2,
             "draw_adv_inner_is_better": True,
             "use_weight_analysis": True,
-            "weight_baseline": 55.0,
-            "per_kg_penalty": 1.2
         },
         "ATTELE_AUTOSTART": {
             "w_odds": 0.7, "w_draw": 0.25, "w_weight": 0.05,
             "draw_adv_inner_is_better": False,
-            "use_weight_analysis": False
+            "use_weight_analysis": False,
         },
         "ATTELE_VOLTE": {
             "w_odds": 0.85, "w_draw": 0.05, "w_weight": 0.1,
             "draw_adv_inner_is_better": False,
-            "use_weight_analysis": False
+            "use_weight_analysis": False,
         }
     }.get(race_type, {
         "w_odds": 0.6, "w_draw": 0.3, "w_weight": 0.1,
         "draw_adv_inner_is_better": True,
-        "use_weight_analysis": True
+        "use_weight_analysis": True,
     })
     
     # Ajustement dynamique selon le nombre de partants
@@ -504,7 +525,7 @@ def analyze_race_adaptive(df, race_type="AUTO"):
     predictor = HorseRacingPredictor()
     df_clean, features_df, feature_names = prepare_features_ml(df, predictor)
     
-    # Calcul des scores de base
+    # Calcul des scores de base avec gestion de type robuste
     df_clean['score_odds'] = 1 / df_clean['odds_numeric']
     df_clean['score_draw'] = 1 / df_clean['draw_numeric']
     
@@ -512,6 +533,11 @@ def analyze_race_adaptive(df, race_type="AUTO"):
         df_clean['score_weight'] = 1 / df_clean['weight_kg']
     else:
         df_clean['score_weight'] = 0.0
+    
+    # Conversion en float pour éviter les problèmes
+    df_clean['score_odds'] = pd.to_numeric(df_clean['score_odds'], errors='coerce').fillna(0)
+    df_clean['score_draw'] = pd.to_numeric(df_clean['score_draw'], errors='coerce').fillna(0)
+    df_clean['score_weight'] = pd.to_numeric(df_clean['score_weight'], errors='coerce').fillna(0)
     
     # Score de base avec pondérations
     df_clean['score_base'] = (
@@ -558,27 +584,30 @@ def analyze_race_adaptive(df, race_type="AUTO"):
     
     return df_ranked, predictor if use_ml else None, race_type, config
 
-# ==== FONCTIONS UTILITAIRES ====
+# ==== FONCTIONS UTILITAIRES CORRIGÉES ====
 def safe_float_convert(value):
-    if pd.isna(value):
+    """Conversion sécurisée vers float"""
+    if pd.isna(value) or value is None:
         return np.nan
     try:
         cleaned = str(value).replace(',', '.').strip()
         return float(cleaned)
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         return np.nan
 
 def safe_int_convert(value):
-    if pd.isna(value):
+    """Conversion sécurisée vers entier"""
+    if pd.isna(value) or value is None:
         return np.nan
     try:
         cleaned = re.search(r'\d+', str(value))
         return int(cleaned.group()) if cleaned else np.nan
-    except (ValueError, AttributeError):
+    except (ValueError, AttributeError, TypeError):
         return np.nan
 
 def extract_weight_kg(poids_str):
-    if pd.isna(poids_str):
+    """Extrait le poids en kg depuis une chaîne"""
+    if pd.isna(poids_str) or poids_str is None:
         return np.nan
     try:
         # Plusieurs formats possibles
@@ -586,12 +615,19 @@ def extract_weight_kg(poids_str):
         if match:
             return float(match.group(1).replace(',', '.'))
         return np.nan
-    except:
+    except (ValueError, TypeError):
         return np.nan
 
 def nettoyer_donnees(ligne):
-    ligne = ''.join(e for e in ligne if e.isalnum() or e.isspace() or e in ['.', ',', '-', '(', ')', '%'])
-    return ligne.strip()
+    """Nettoyage des données texte"""
+    if pd.isna(ligne) or ligne is None:
+        return ""
+    try:
+        ligne = str(ligne)
+        ligne = ''.join(e for e in ligne if e.isalnum() or e.isspace() or e in ['.', ',', '-', '(', ')', '%'])
+        return ligne.strip()
+    except:
+        return ""
 
 def auto_detect_race_type(df):
     """Détection automatique simplifiée"""
@@ -601,7 +637,7 @@ def auto_detect_race_type(df):
             return "PLAT"
     return "ATTELE_AUTOSTART"
 
-# ==== INTERFACE STREAMLIT ====
+# ==== INTERFACE STREAMLIT CORRIGÉE ====
 def main():
     st.set_page_config(
         page_title="Pronostics Hippiques ML",
@@ -662,7 +698,7 @@ def main():
                 display_results(df_ranked, predictor, detected_type, config, len(df_ranked))
                 
             except Exception as e:
-                st.error(f"❌ Erreur lors de l'analyse: {e}")
+                st.error(f"❌ Erreur lors de l'analyse: {str(e)}")
 
 def generate_test_data(n_runners):
     """Génère des données de test réalistes"""
@@ -689,7 +725,7 @@ def display_results(df_ranked, predictor, race_type, config, n_runners):
     with col2:
         st.metric("📊 Type", race_type)
     with col3:
-        ml_used = "✅" if predictor else "⚠️ Classique"
+        ml_used = "✅ ML" if predictor else "⚠️ Classique"
         st.metric("🤖 Méthode", ml_used)
     with col4:
         top1_prob = df_ranked.iloc[0]['ml_probability'] * 100
@@ -697,11 +733,34 @@ def display_results(df_ranked, predictor, race_type, config, n_runners):
     
     # Tableau des résultats
     st.subheader("📊 Classement final")
-    display_df = df_ranked[['rang', 'Nom', 'ml_probability', 'Cote', 'Numéro de corde']].copy()
-    display_df['Probabilité'] = (display_df['ml_probability'] * 100).round(1).astype(str) + '%'
-    display_df = display_df.rename(columns={'rang': 'Rang', 'Nom': 'Cheval', 'Cote': 'Cote', 'Numéro de corde': 'Corde'})
     
-    st.dataframe(display_df[['Rang', 'Cheval', 'Probabilité', 'Cote', 'Corde']], use_container_width=True)
+    # S'assurer que les colonnes existent
+    display_cols = ['rang', 'Nom', 'ml_probability']
+    if 'Cote' in df_ranked.columns:
+        display_cols.append('Cote')
+    if 'Numéro de corde' in df_ranked.columns:
+        display_cols.append('Numéro de corde')
+    
+    display_df = df_ranked[display_cols].copy()
+    display_df['Probabilité'] = (display_df['ml_probability'] * 100).round(1).astype(str) + '%'
+    
+    # Renommage des colonnes
+    rename_dict = {'rang': 'Rang', 'Nom': 'Cheval'}
+    if 'Cote' in display_df.columns:
+        rename_dict['Cote'] = 'Cote'
+    if 'Numéro de corde' in display_df.columns:
+        rename_dict['Numéro de corde'] = 'Corde'
+    
+    display_df = display_df.rename(columns=rename_dict)
+    
+    # Colonnes à afficher
+    show_cols = ['Rang', 'Cheval', 'Probabilité']
+    if 'Cote' in display_df.columns:
+        show_cols.append('Cote')
+    if 'Corde' in display_df.columns:
+        show_cols.append('Corde')
+    
+    st.dataframe(display_df[show_cols], use_container_width=True)
     
     # Recommendations paris
     st.subheader("🎯 Recommendations pour Paris")
@@ -717,19 +776,22 @@ def display_betting_recommendations(df_ranked, n_runners, predictor):
     
     with col2:
         # Meilleure valeur
-        value_picks = df_ranked[
-            (df_ranked['ml_probability'] > df_ranked['ml_probability'].quantile(0.6)) &
-            (df_ranked['odds_numeric'] > df_ranked['odds_numeric'].median())
-        ]
-        if len(value_picks) > 0:
-            best_value = value_picks.iloc[0]
-            st.metric("💎 Meilleure valeur", best_value['Nom'], f"Cote: {best_value['odds_numeric']:.1f}")
+        if 'odds_numeric' in df_ranked.columns:
+            value_picks = df_ranked[
+                (df_ranked['ml_probability'] > df_ranked['ml_probability'].quantile(0.6)) &
+                (df_ranked['odds_numeric'] > df_ranked['odds_numeric'].median())
+            ]
+            if len(value_picks) > 0:
+                best_value = value_picks.iloc[0]
+                st.metric("💎 Meilleure valeur", best_value['Nom'], f"Cote: {best_value['odds_numeric']:.1f}")
+            else:
+                st.metric("💎 Meilleure valeur", "Non trouvée", "")
         else:
-            st.metric("💎 Meilleure valeur", "Non trouvée", "")
+            st.metric("💎 Meilleure valeur", "Données manquantes", "")
     
     with col3:
-        if predictor:
-            auc = predictor.performance_metrics['test_auc']
+        if predictor and hasattr(predictor, 'performance_metrics'):
+            auc = predictor.performance_metrics.get('test_auc', 0.5)
             confiance = "Élevée" if auc > 0.7 else "Moyenne"
             st.metric("📈 Confiance modèle", confiance, f"AUC: {auc:.3f}")
         else:
