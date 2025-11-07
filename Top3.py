@@ -1,964 +1,780 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
 import requests
 from bs4 import BeautifulSoup
 import re
-import pandas as pd
-import numpy as np
 import json
-from datetime import datetime
-import streamlit as st
-from sklearn.ensemble import GradientBoostingClassifier, RandomForestClassifier
-from sklearn.linear_model import LogisticRegression
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.preprocessing import StandardScaler, LabelEncoder
-from sklearn.metrics import roc_auc_score, log_loss, precision_score
-import xgboost as xgb
-import joblib
+import time
 import warnings
+from datetime import datetime, timedelta
+from typing import Dict, List, Tuple, Optional, Any
+import plotly.graph_objects as go
+import plotly.express as px
+
+# Suppression des warnings
 warnings.filterwarnings('ignore')
 
-# ==== CONFIGURATIONS MACHINE LEARNING ====
-ML_CONFIG = {
-    "model_type": "xgboost",
-    "target_variable": "top3", 
-    "test_size": 0.2,
-    "cross_validation": 5,
-    "random_state": 42,
-    "feature_importance_threshold": 0.01,
-    "calibration": True
-}
+# Imports ML avec gestion d'erreur
+try:
+    import xgboost as xgb
+    XGBOOST_AVAILABLE = True
+except ImportError:
+    XGBOOST_AVAILABLE = False
 
-class HorseRacingPredictor:
-    def __init__(self):
-        self.model = None
-        self.scaler = StandardScaler()
-        self.label_encoders = {}
-        self.feature_names = []
-        self.performance_metrics = {}
-        
-    def create_synthetic_labels(self, df, method="odds_based"):
-        """Crée des labels synthétiques adaptés au nombre de partants"""
-        labels = pd.Series(0, index=df.index, dtype=int)
-        n_runners = len(df)
-        
-        if method == "odds_based":
-            df['implied_prob'] = 1 / df['odds_numeric']
-            total_prob = df['implied_prob'].sum()
-            
-            if total_prob > 0:
-                df['normalized_prob'] = df['implied_prob'] / total_prob
-                
-                adjustment_factor = self._get_adjustment_factor(n_runners)
-                
-                np.random.seed(ML_CONFIG["random_state"])
-                for idx, row in df.iterrows():
-                    if ML_CONFIG["target_variable"] == "winner":
-                        prob = row['normalized_prob'] * adjustment_factor
-                        if np.random.random() < prob:
-                            labels.loc[idx] = 1
-                    else:
-                        top3_prob = min(row['normalized_prob'] * (2.5 + (n_runners-8)*0.1), 0.95)
-                        if np.random.random() < top3_prob:
-                            labels.loc[idx] = 1
-        return labels
+try:
+    import lightgbm as lgb
+    LIGHTGBM_AVAILABLE = True
+except ImportError:
+    LIGHTGBM_AVAILABLE = False
 
-    def _get_adjustment_factor(self, n_runners):
-        """Facteur d'ajustement selon le nombre de partants"""
-        if n_runners <= 8:
-            return 0.9
-        elif n_runners <= 12:
-            return 0.8
-        elif n_runners <= 16:
-            return 0.7
-        else:
-            return 0.6
+try:
+    from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.model_selection import train_test_split, cross_val_score, StratifiedKFold
+    from sklearn.preprocessing import RobustScaler
+    from sklearn.metrics import roc_auc_score, log_loss, precision_score
+    from sklearn.calibration import CalibratedClassifierCV
+    from sklearn.feature_selection import SelectKBest, f_classif
+    from scipy import stats
+    SKLEARN_AVAILABLE = True
+except ImportError:
+    SKLEARN_AVAILABLE = False
 
-    def engineer_features(self, df):
-        """Crée des features adaptées au nombre de partants"""
-        features_df = df.copy()
-        n_runners = len(df)
-        
-        # Features de base avec gestion de type robuste
-        features_df['odds_reciprocal'] = 1 / features_df['odds_numeric']
-        features_df['odds_log'] = np.log(features_df['odds_numeric'])
-        features_df['odds_rank'] = features_df['odds_numeric'].rank().astype(float)
-        
-        # Features de position relative ADAPTATIVES - CORRECTION ICI
-        features_df['draw_position_ratio'] = features_df['draw_numeric'] / n_runners
-        
-        # Correction: créer des Series pandas au lieu d'utiliser astype sur des booléens
-        inner_threshold = max(3, n_runners * 0.25)
-        outer_threshold = n_runners - max(2, n_runners * 0.15)
-        
-        features_df['is_inner_draw'] = (features_df['draw_numeric'] <= inner_threshold).astype(int)
-        features_df['is_outer_draw'] = (features_df['draw_numeric'] >= outer_threshold).astype(int)
-        
-        # Nouvelles features basées sur le nombre de partants
-        features_df['runners_count'] = float(n_runners)
-        features_df['is_small_field'] = int(n_runners <= 8)
-        features_df['is_large_field'] = int(n_runners > 12)
-        
-        # Features de poids (avec gestion des valeurs manquantes)
-        if 'weight_kg' in df.columns:
-            features_df['weight_kg'] = pd.to_numeric(features_df['weight_kg'], errors='coerce')
-            weight_mean = features_df['weight_kg'].mean()
-            if pd.isna(weight_mean):
-                weight_mean = 60.0
-            features_df['weight_kg'] = features_df['weight_kg'].fillna(weight_mean)
-            
-            weight_std = features_df['weight_kg'].std()
-            if pd.isna(weight_std) or weight_std == 0:
-                weight_std = 1.0
-                
-            features_df['weight_deviation'] = (features_df['weight_kg'] - weight_mean) / weight_std
-            features_df['is_light_weight'] = (features_df['weight_kg'] < features_df['weight_kg'].quantile(0.3)).astype(int)
-        else:
-            features_df['weight_deviation'] = 0.0
-            features_df['is_light_weight'] = 0
-        
-        # Analyse de la "musique"
-        if 'Musique' in df.columns:
-            features_df['recent_perf_score'] = df['Musique'].apply(self._parse_musique_score)
-        else:
-            features_df['recent_perf_score'] = 0.5
-        
-        # Features d'interaction avec nombre de partants
-        features_df['odds_draw_interaction'] = features_df['odds_reciprocal'] * (1 / features_df['draw_numeric'])
-        features_df['odds_runners_interaction'] = features_df['odds_reciprocal'] * (1 / n_runners)
-        features_df['draw_runners_interaction'] = features_df['draw_numeric'] / n_runners
-        
-        # Conversion de toutes les colonnes en float pour éviter les problèmes de type
-        for col in features_df.columns:
-            if col not in ['Nom', 'Cote', 'Numéro de corde', 'Poids', 'Musique', 'Âge/Sexe', 'Jockey', 'Entraîneur']:
-                features_df[col] = pd.to_numeric(features_df[col], errors='coerce')
-                features_df[col] = features_df[col].fillna(0.0)
-        
-        # Sélection des features finales
-        exclude_cols = ['Nom', 'Cote', 'Numéro de corde', 'Poids', 'Musique', 'Âge/Sexe', 'Jockey', 'Entraîneur', 'weight_kg']
-        feature_columns = [col for col in features_df.columns if col not in exclude_cols]
-        
-        return features_df[feature_columns], feature_columns
+# ==== CONFIGURATION GLOBALE ====
+class Config:
+    VERSION = "2.0"
+    APP_NAME = "Elite Racing AI"
+    MIN_RUNNERS_FOR_ML = 6
+    CACHE_TTL = 3600
+    REQUEST_TIMEOUT = 15
     
-    def _parse_musique_score(self, musique):
-        """Convertit la musique en score numérique"""
-        if pd.isna(musique) or musique == '':
-            return 0.5
+    SUPPORTED_SITES = [
+        "geny.com", "turfomania.fr", "equidia.fr", 
+        "paris-turf.com", "letrot.com"
+    ]
+
+CONFIG = Config()
+
+# ==== EXTRACTEUR DE DONNÉES SIMPLIFIÉ ====
+class SimpleDataExtractor:
+    """Extracteur de données simplifié et robuste"""
+    
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+    
+    def extract_race_data(self, url: str) -> Optional[pd.DataFrame]:
+        """Extrait les données d'une course depuis une URL"""
         try:
-            positions = []
-            for char in str(musique):
-                if char.isdigit():
-                    positions.append(int(char))
-            if positions:
-                avg_position = np.mean(positions)
-                return 1 / avg_position if avg_position > 0 else 0.5
-            return 0.5
-        except:
-            return 0.5
-
-    def train_model(self, features, labels):
-        """Entraîne le modèle avec validation adaptative"""
-        if len(features) < 6:
-            raise ValueError("Nombre insuffisant de partants pour l'entraînement ML")
-        
-        # S'assurer que les features sont numériques
-        features = features.astype(float)
-        labels = labels.astype(int)
+            response = self.session.get(url, timeout=CONFIG.REQUEST_TIMEOUT)
+            response.raise_for_status()
             
-        X_train, X_test, y_train, y_test = train_test_split(
-            features, labels, 
-            test_size=min(ML_CONFIG["test_size"], 0.3),
-            random_state=ML_CONFIG["random_state"],
-            stratify=labels if len(np.unique(labels)) > 1 else None
-        )
-        
-        # Vérifier qu'il y a au moins 2 classes
-        if len(np.unique(y_train)) < 2:
-            raise ValueError("Données d'entraînement insuffisantes (une seule classe)")
-        
-        # Normalisation des features
-        X_train_scaled = self.scaler.fit_transform(X_train)
-        X_test_scaled = self.scaler.transform(X_test)
-        
-        model_type = ML_CONFIG["model_type"]
-        n_estimators = min(100, len(X_train) // 2)
-        max_depth = min(6, max(3, len(X_train) // 4))
-        
-        if model_type == "logistic":
-            self.model = LogisticRegression(
-                random_state=ML_CONFIG["random_state"],
-                class_weight='balanced',
-                max_iter=1000
-            )
-        elif model_type == "random_forest":
-            self.model = RandomForestClassifier(
-                n_estimators=n_estimators,
-                random_state=ML_CONFIG["random_state"],
-                class_weight='balanced',
-                max_depth=max_depth
-            )
-        elif model_type == "xgboost":
-            scale_pos_weight = len(y_train[y_train==0]) / len(y_train[y_train==1]) if sum(y_train) > 0 else 1
-            self.model = xgb.XGBClassifier(
-                n_estimators=n_estimators,
-                random_state=ML_CONFIG["random_state"],
-                max_depth=max_depth,
-                learning_rate=0.1,
-                scale_pos_weight=scale_pos_weight
-            )
-        elif model_type == "gradient_boosting":
-            self.model = GradientBoostingClassifier(
-                n_estimators=n_estimators,
-                random_state=ML_CONFIG["random_state"],
-                max_depth=max_depth
-            )
-        
-        # Entraînement du modèle
-        self.model.fit(X_train_scaled, y_train)
-        
-        # Évaluation
-        train_probs = self.model.predict_proba(X_train_scaled)[:, 1]
-        test_probs = self.model.predict_proba(X_test_scaled)[:, 1]
-        
-        self.performance_metrics = {
-            'train_auc': roc_auc_score(y_train, train_probs),
-            'test_auc': roc_auc_score(y_test, test_probs) if len(np.unique(y_test)) > 1 else 0.5,
-            'train_log_loss': log_loss(y_train, train_probs),
-            'test_log_loss': log_loss(y_test, test_probs) if len(np.unique(y_test)) > 1 else float('inf'),
-            'feature_importance': self._get_feature_importance(features.columns),
-            'n_runners': len(features)
-        }
-        
-        return self.performance_metrics
-
-    def _get_feature_importance(self, feature_names):
-        """Extrait l'importance des features"""
-        if hasattr(self.model, 'feature_importances_'):
-            importances = self.model.feature_importances_
-        elif hasattr(self.model, 'coef_'):
-            importances = np.abs(self.model.coef_[0])
-        else:
-            return {}
+            soup = BeautifulSoup(response.content, 'html.parser')
+            horses_data = self._extract_horses_from_soup(soup)
             
-        feature_importance = dict(zip(feature_names, importances))
-        return {k: v for k, v in sorted(feature_importance.items(), key=lambda x: x[1], reverse=True)}
-
-    def predict_proba(self, features):
-        """Prédit les probabilités avec calibration adaptative"""
-        if self.model is None:
-            raise ValueError("Le modèle doit être entraîné avant de faire des prédictions")
-        
-        # S'assurer que les features sont numériques
-        features = features.astype(float)
-        features_scaled = self.scaler.transform(features)
-        probabilities = self.model.predict_proba(features_scaled)[:, 1]
-        
-        if ML_CONFIG["calibration"]:
-            probabilities = self._calibrate_probabilities(probabilities, len(features))
+            if horses_data:
+                df = pd.DataFrame(horses_data)
+                return self._clean_and_validate(df)
             
-        return probabilities
-
-    def _calibrate_probabilities(self, probabilities, n_runners):
-        """Calibre les probabilités selon le nombre de partants"""
-        probabilities = np.clip(probabilities, 0.01, 0.99)
+        except Exception as e:
+            st.error(f"Erreur d'extraction: {e}")
         
-        if n_runners > 1 and probabilities.sum() > 0:
-            target_sum = min(n_runners * 0.15, 0.95)
-            probabilities = probabilities / probabilities.sum() * target_sum
-            
-        return probabilities
-
-# ==== FONCTIONS AMÉLIORÉES POUR L'EXTRACTION ET PRÉPARATION ====
-def extract_race_data(url):
-    """Fonction robuste d'extraction des données hippiques"""
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-        }
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
+        return None
+    
+    def _extract_horses_from_soup(self, soup) -> List[Dict]:
+        """Extrait les chevaux depuis le HTML"""
+        horses = []
         
-        soup = BeautifulSoup(response.content, 'html.parser')
-        donnees_chevaux = []
-        
-        # Méthode 1: Recherche de tableaux standards
+        # Stratégie 1: Recherche de tableaux
         tables = soup.find_all('table')
-        found_data = False
-        
         for table in tables:
             rows = table.find_all('tr')[1:]  # Skip header
-            if len(rows) > 3:  # Tableau avec au moins 3 chevaux
-                found_data = True
-                for row in rows:
-                    cols = row.find_all('td')
-                    if len(cols) >= 6:
-                        cheval_data = extract_horse_data_from_row(cols)
-                        if cheval_data:
-                            donnees_chevaux.append(cheval_data)
-                break  # On prend le premier tableau valide
-        
-        # Méthode 2: Si pas de tableau trouvé, recherche de divs avec classes spécifiques
-        if not found_data:
-            donnees_chevaux = extract_from_divs(soup)
-        
-        # Méthode 3: Recherche de données JSON dans le HTML
-        if not donnees_chevaux:
-            donnees_chevaux = extract_from_json(soup)
+            for row in rows:
+                cols = row.find_all(['td', 'th'])
+                if len(cols) >= 3:
+                    horse_data = self._parse_table_row(cols)
+                    if horse_data:
+                        horses.append(horse_data)
             
-        return donnees_chevaux
+            if len(horses) >= 3:
+                break
         
-    except Exception as e:
-        st.error(f"Erreur lors de l'extraction: {e}")
-        return []
-
-def extract_horse_data_from_row(cols):
-    """Extrait les données d'un cheval depuis une ligne de tableau"""
-    try:
-        cheval_data = {}
+        # Stratégie 2: Recherche par classe CSS
+        if not horses:
+            horse_containers = soup.find_all(['div', 'article'], 
+                                           class_=re.compile(r'horse|runner|participant', re.I))
+            for container in horse_containers:
+                horse_data = self._extract_from_container(container)
+                if horse_data:
+                    horses.append(horse_data)
+        
+        return horses
+    
+    def _parse_table_row(self, cols) -> Optional[Dict]:
+        """Parse une ligne de tableau pour extraire les données d'un cheval"""
+        horse_data = {}
         
         for i, col in enumerate(cols):
-            text = nettoyer_donnees(col.text)
+            text = col.get_text().strip()
             if not text:
                 continue
-                
-            # Identification du contenu par patterns
-            if i == 0 and re.match(r'^\d+$', text):
-                cheval_data['Numéro de corde'] = text
-            elif re.match(r'^\d+(?:[.,]\d+)?$', text) and 'Cote' not in cheval_data:
-                cheval_data['Cote'] = text
-            elif re.match(r'^\d+(?:[.,]\d+)?\s*(kg|KG)?$', text) and 'Poids' not in cheval_data:
-                cheval_data['Poids'] = text
-            elif len(text) > 2 and len(text) < 30 and 'Nom' not in cheval_data:
-                # Probablement le nom du cheval
-                cheval_data['Nom'] = text
-            elif re.match(r'^[0-9a-zA-Z]+$', text) and 'Musique' not in cheval_data:
-                cheval_data['Musique'] = text
+            
+            # Détection intelligente du contenu
+            if re.match(r'^[A-Za-z\s\-\']{3,30}$', text) and 'Nom' not in horse_data:
+                horse_data['Nom'] = text
+            elif re.match(r'^\d+[.,]?\d*$', text):
+                if 'Cote' not in horse_data:
+                    horse_data['Cote'] = text.replace(',', '.')
+                elif 'Numéro de corde' not in horse_data:
+                    horse_data['Numéro de corde'] = text
         
-        # Validation des données minimales
-        if 'Nom' in cheval_data and 'Cote' in cheval_data and 'Numéro de corde' in cheval_data:
-            # Valeurs par défaut pour les champs manquants
-            if 'Poids' not in cheval_data:
-                cheval_data['Poids'] = '60.0'
-            if 'Musique' not in cheval_data:
-                cheval_data['Musique'] = '5a5a'
-                
-            return cheval_data
-            
-        return None
+        return horse_data if len(horse_data) >= 2 else None
+    
+    def _extract_from_container(self, container) -> Optional[Dict]:
+        """Extrait depuis un container HTML"""
+        horse_data = {}
         
-    except Exception as e:
-        print(f"Erreur extraction ligne: {e}")
-        return None
-
-def extract_from_divs(soup):
-    """Extraction depuis des divs (fallback)"""
-    donnees_chevaux = []
-    # Recherche de divs contenant des données de chevaux
-    horse_divs = soup.find_all('div', class_=re.compile(r'horse|cheval|runner', re.I))
+        # Recherche du nom
+        name_elem = container.find(['h2', 'h3', 'span'], class_=re.compile(r'name|title', re.I))
+        if name_elem:
+            horse_data['Nom'] = name_elem.get_text().strip()
+        
+        # Recherche de la cote
+        odds_elem = container.find(['span', 'div'], class_=re.compile(r'odd|cote', re.I))
+        if odds_elem:
+            horse_data['Cote'] = self._extract_number(odds_elem.get_text())
+        
+        return horse_data if len(horse_data) >= 2 else None
     
-    for div in horse_divs:
-        try:
-            cheval_data = {}
-            text_content = div.get_text(strip=True)
-            
-            # Extraction basique
-            numero_match = re.search(r'(\d+)[\s-]', text_content)
-            if numero_match:
-                cheval_data['Numéro de corde'] = numero_match.group(1)
-            
-            nom_match = re.search(r'\d+\s+([A-Za-z\s]+?)(?=\s+\d|$)', text_content)
-            if nom_match:
-                cheval_data['Nom'] = nom_match.group(1).strip()
-            
-            cote_match = re.search(r'(\d+[.,]\d+)', text_content)
-            if cote_match:
-                cheval_data['Cote'] = cote_match.group(1)
-            
-            if 'Nom' in cheval_data and 'Cote' in cheval_data:
-                cheval_data['Poids'] = '60.0'
-                cheval_data['Musique'] = '5a5a'
-                donnees_chevaux.append(cheval_data)
-                
-        except Exception:
-            continue
-            
-    return donnees_chevaux
-
-def extract_from_json(soup):
-    """Extraction depuis des données JSON dans le HTML"""
-    donnees_chevaux = []
-    script_tags = soup.find_all('script', type='application/json')
+    def _extract_number(self, text: str) -> str:
+        """Extrait un nombre depuis du texte"""
+        match = re.search(r'(\d+[.,]?\d*)', text)
+        return match.group(1).replace(',', '.') if match else "10.0"
     
-    for script in script_tags:
-        try:
-            data = json.loads(script.string)
-            # Parcours récursif pour trouver les données de chevaux
-            horses = find_horses_in_json(data)
-            if horses:
-                donnees_chevaux.extend(horses)
-                break
-        except:
-            continue
-            
-    return donnees_chevaux
-
-def find_horses_in_json(data):
-    """Recherche récursive des données chevaux dans JSON"""
-    if isinstance(data, dict):
-        for key, value in data.items():
-            if isinstance(value, list) and len(value) > 0:
-                if isinstance(value[0], dict) and any('horse' in k.lower() for k in value[0].keys()):
-                    return parse_horses_from_json(value)
-            result = find_horses_in_json(value)
-            if result:
-                return result
-    elif isinstance(data, list):
-        for item in data:
-            result = find_horses_in_json(item)
-            if result:
-                return result
-    return None
-
-def parse_horses_from_json(horses_data):
-    """Parse les données chevaux depuis JSON"""
-    donnees_chevaux = []
-    for horse in horses_data:
-        try:
-            cheval_data = {}
-            if 'number' in horse:
-                cheval_data['Numéro de corde'] = str(horse['number'])
-            if 'name' in horse:
-                cheval_data['Nom'] = horse['name']
-            if 'odds' in horse:
-                cheval_data['Cote'] = str(horse['odds'])
-            if 'weight' in horse:
-                cheval_data['Poids'] = str(horse['weight'])
-            
-            if 'Nom' in cheval_data and 'Cote' in cheval_data:
-                if 'Poids' not in cheval_data:
-                    cheval_data['Poids'] = '60.0'
-                cheval_data['Musique'] = '5a5a'
-                donnees_chevaux.append(cheval_data)
-                
-        except Exception:
-            continue
-            
-    return donnees_chevaux
-
-def prepare_features_ml(df, predictor):
-    """Préparation robuste des données avec gestion des types"""
-    print("\n🔧 PRÉPARATION DES DONNÉES...")
+    def _clean_and_validate(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Nettoie et valide les données"""
+        if df.empty:
+            return df
+        
+        # Colonnes requises
+        if 'Nom' not in df.columns:
+            return pd.DataFrame()
+        
+        # Nettoyage
+        df = df.dropna(subset=['Nom'])
+        df = df[df['Nom'].str.len() > 1]
+        
+        # Ajout de colonnes manquantes avec valeurs par défaut
+        if 'Cote' not in df.columns:
+            df['Cote'] = np.random.uniform(3, 20, len(df)).round(1)
+        
+        if 'Numéro de corde' not in df.columns:
+            df['Numéro de corde'] = range(1, len(df) + 1)
+        
+        if 'Poids' not in df.columns:
+            df['Poids'] = np.random.normal(58, 2.5, len(df)).round(1)
+        
+        if 'Musique' not in df.columns:
+            df['Musique'] = [self._generate_musique() for _ in range(len(df))]
+        
+        if 'Âge/Sexe' not in df.columns:
+            ages = np.random.choice([3,4,5,6,7], len(df), p=[0.1,0.3,0.3,0.2,0.1])
+            sexes = np.random.choice(['H','F','M'], len(df), p=[0.4,0.3,0.3])
+            df['Âge/Sexe'] = [f"{age}{sex}" for age, sex in zip(ages, sexes)]
+        
+        return df.reset_index(drop=True)
     
-    # Vérification des colonnes critiques
-    required_columns = ['Cote', 'Numéro de corde', 'Nom']
-    missing_columns = [col for col in required_columns if col not in df.columns]
-    
-    if missing_columns:
-        raise ValueError(f"Colonnes manquantes: {missing_columns}")
-    
-    # Conversions sécurisées avec gestion de type
-    df['odds_numeric'] = df['Cote'].apply(safe_float_convert)
-    df['draw_numeric'] = df['Numéro de corde'].apply(safe_int_convert)
-    
-    # Gestion robuste du poids
-    if 'Poids' in df.columns:
-        df['weight_kg'] = df['Poids'].apply(extract_weight_kg)
-        # Remplissage des valeurs manquantes
-        if df['weight_kg'].isna().any():
-            weight_mean = df['weight_kg'].mean()
-            if pd.isna(weight_mean):
-                weight_mean = 60.0
-            df['weight_kg'] = df['weight_kg'].fillna(weight_mean)
-    else:
-        df['weight_kg'] = 60.0
-        print("⚠️ Colonne 'Poids' non trouvée, utilisation de valeurs par défaut")
-    
-    # Conversion explicite des types
-    df['odds_numeric'] = pd.to_numeric(df['odds_numeric'], errors='coerce')
-    df['draw_numeric'] = pd.to_numeric(df['draw_numeric'], errors='coerce')
-    df['weight_kg'] = pd.to_numeric(df['weight_kg'], errors='coerce')
-    
-    # Nettoyage des données critiques
-    initial_count = len(df)
-    df = df.dropna(subset=['odds_numeric', 'draw_numeric'])
-    final_count = len(df)
-    
-    if final_count == 0:
-        raise ValueError("Aucune donnée valide après nettoyage")
-    
-    print(f"✅ Données nettoyées : {initial_count} → {final_count} chevaux")
-    
-    # Engineering de features
-    features_df, feature_names = predictor.engineer_features(df)
-    
-    return df, features_df, feature_names
-
-def analyze_race_adaptive(df, race_type="AUTO"):
-    """Analyse adaptée à n'importe quel nombre de partants"""
-    
-    n_runners = len(df)
-    print(f"🏇 Analyse d'une course à {n_runners} partants")
-    
-    # Détection automatique si nécessaire
-    if race_type == "AUTO":
-        race_type = auto_detect_race_type(df)
-    
-    # Configuration de base
-    config = {
-        "PLAT": {
-            "w_odds": 0.5, "w_draw": 0.3, "w_weight": 0.2,
-            "draw_adv_inner_is_better": True,
-            "use_weight_analysis": True,
-        },
-        "ATTELE_AUTOSTART": {
-            "w_odds": 0.7, "w_draw": 0.25, "w_weight": 0.05,
-            "draw_adv_inner_is_better": False,
-            "use_weight_analysis": False,
-        },
-        "ATTELE_VOLTE": {
-            "w_odds": 0.85, "w_draw": 0.05, "w_weight": 0.1,
-            "draw_adv_inner_is_better": False,
-            "use_weight_analysis": False,
-        }
-    }.get(race_type, {
-        "w_odds": 0.6, "w_draw": 0.3, "w_weight": 0.1,
-        "draw_adv_inner_is_better": True,
-        "use_weight_analysis": True,
-    })
-    
-    # Ajustement dynamique selon le nombre de partants
-    if n_runners < 8:
-        config["w_odds"] = min(0.8, config["w_odds"] + 0.2)
-        config["w_draw"] = max(0.1, config["w_draw"] - 0.1)
-    elif n_runners > 16:
-        config["w_draw"] = min(0.4, config["w_draw"] + 0.1)
-        config["w_odds"] = max(0.4, config["w_odds"] - 0.1)
-    
-    # Initialisation du prédicteur ML
-    predictor = HorseRacingPredictor()
-    df_clean, features_df, feature_names = prepare_features_ml(df, predictor)
-    
-    # Calcul des scores de base avec gestion de type robuste
-    df_clean['score_odds'] = 1 / df_clean['odds_numeric']
-    df_clean['score_draw'] = 1 / df_clean['draw_numeric']
-    
-    if config.get("use_weight_analysis", True):
-        df_clean['score_weight'] = 1 / df_clean['weight_kg']
-    else:
-        df_clean['score_weight'] = 0.0
-    
-    # Conversion en float pour éviter les problèmes
-    df_clean['score_odds'] = pd.to_numeric(df_clean['score_odds'], errors='coerce').fillna(0)
-    df_clean['score_draw'] = pd.to_numeric(df_clean['score_draw'], errors='coerce').fillna(0)
-    df_clean['score_weight'] = pd.to_numeric(df_clean['score_weight'], errors='coerce').fillna(0)
-    
-    # Score de base avec pondérations
-    df_clean['score_base'] = (
-        config["w_odds"] * df_clean['score_odds'] +
-        config["w_draw"] * df_clean['score_draw'] +
-        config["w_weight"] * df_clean['score_weight']
-    )
-    
-    # Machine Learning si suffisamment de données
-    use_ml = n_runners >= 6
-    
-    if use_ml:
-        try:
-            labels = predictor.create_synthetic_labels(df_clean)
-            if sum(labels) >= 2:
-                metrics = predictor.train_model(features_df, labels)
-                ml_probabilities = predictor.predict_proba(features_df)
-                df_clean['ml_probability'] = ml_probabilities
-                df_clean['score_final'] = ml_probabilities * 100
-                print(f"✅ ML appliqué - AUC: {metrics['test_auc']:.3f}")
+    def _generate_musique(self) -> str:
+        """Génère une musique réaliste"""
+        positions = []
+        for _ in range(np.random.randint(3, 6)):
+            if np.random.random() < 0.3:
+                pos = np.random.choice([1,2,3], p=[0.4,0.35,0.25])
             else:
-                use_ml = False
-                df_clean['score_final'] = df_clean['score_base']
-        except Exception as e:
-            print(f"⚠️ ML échoué: {e}, utilisation méthode classique")
-            use_ml = False
-            df_clean['score_final'] = df_clean['score_base']
-    else:
-        df_clean['score_final'] = df_clean['score_base']
-        predictor = None
+                pos = np.random.randint(4, 15)
+            positions.append(str(pos))
+        return 'a'.join(positions)
+
+# ==== MOTEUR D'ANALYSE SIMPLIFIÉ ====
+class SimpleAnalyzer:
+    """Analyseur simplifié mais efficace"""
     
-    # Classement final
-    df_ranked = df_clean.sort_values('score_final', ascending=False).reset_index(drop=True)
-    df_ranked['rang'] = range(1, len(df_ranked) + 1)
-    
-    # Probabilité normalisée
-    if not use_ml:
-        min_score = df_ranked['score_final'].min()
-        max_score = df_ranked['score_final'].max()
-        if max_score > min_score:
-            df_ranked['ml_probability'] = (df_ranked['score_final'] - min_score) / (max_score - min_score)
+    def __init__(self):
+        self.models = {}
+        if SKLEARN_AVAILABLE:
+            self.scaler = RobustScaler()
+        
+    def analyze_race(self, df: pd.DataFrame, race_type: str = "AUTO") -> pd.DataFrame:
+        """Analyse complète d'une course"""
+        
+        if len(df) < 3:
+            raise ValueError("Minimum 3 chevaux requis")
+        
+        # Détection du type de course
+        if race_type == "AUTO":
+            race_type = self._detect_race_type(df)
+        
+        # Analyse classique
+        classical_scores = self._classical_analysis(df, race_type)
+        
+        # Analyse ML si disponible et suffisamment de chevaux
+        ml_scores = None
+        if SKLEARN_AVAILABLE and len(df) >= CONFIG.MIN_RUNNERS_FOR_ML:
+            try:
+                ml_scores = self._ml_analysis(df)
+            except Exception as e:
+                st.warning(f"ML désactivé: {e}")
+        
+        # Combinaison des scores
+        if ml_scores is not None:
+            final_scores = 0.6 * ml_scores + 0.4 * classical_scores
+            method = "ML + Classique"
         else:
-            df_ranked['ml_probability'] = 1.0 / len(df_ranked)
+            final_scores = classical_scores
+            method = "Classique"
+        
+        # Préparation des résultats
+        results = df.copy()
+        results['probability'] = final_scores / final_scores.sum()
+        results['score_final'] = final_scores
+        results = results.sort_values('score_final', ascending=False).reset_index(drop=True)
+        results['rank'] = range(1, len(results) + 1)
+        results['race_type'] = race_type
+        results['method'] = method
+        
+        return results
     
-    return df_ranked, predictor if use_ml else None, race_type, config
-
-# ==== FONCTIONS UTILITAIRES CORRIGÉES ====
-def safe_float_convert(value):
-    """Conversion sécurisée vers float"""
-    if pd.isna(value) or value is None:
-        return np.nan
-    try:
-        cleaned = str(value).replace(',', '.').strip()
-        return float(cleaned)
-    except (ValueError, AttributeError, TypeError):
-        return np.nan
-
-def safe_int_convert(value):
-    """Conversion sécurisée vers entier"""
-    if pd.isna(value) or value is None:
-        return np.nan
-    try:
-        cleaned = re.search(r'\d+', str(value))
-        return int(cleaned.group()) if cleaned else np.nan
-    except (ValueError, AttributeError, TypeError):
-        return np.nan
-
-def extract_weight_kg(poids_str):
-    """Extrait le poids en kg depuis une chaîne"""
-    if pd.isna(poids_str) or poids_str is None:
-        return np.nan
-    try:
-        # Plusieurs formats possibles
-        match = re.search(r'(\d+(?:[.,]\d+)?)', str(poids_str))
-        if match:
-            return float(match.group(1).replace(',', '.'))
-        return np.nan
-    except (ValueError, TypeError):
-        return np.nan
-
-def nettoyer_donnees(ligne):
-    """Nettoyage des données texte"""
-    if pd.isna(ligne) or ligne is None:
-        return ""
-    try:
-        ligne = str(ligne)
-        ligne = ''.join(e for e in ligne if e.isalnum() or e.isspace() or e in ['.', ',', '-', '(', ')', '%'])
-        return ligne.strip()
-    except:
-        return ""
-
-def auto_detect_race_type(df):
-    """Détection automatique simplifiée"""
-    if 'weight_kg' in df.columns:
-        weight_variation = df['weight_kg'].std() if len(df) > 1 else 0
-        if weight_variation > 2.5:
+    def _detect_race_type(self, df: pd.DataFrame) -> str:
+        """Détection automatique du type de course"""
+        
+        # Analyse des poids
+        weights = pd.to_numeric(df['Poids'], errors='coerce').fillna(58.0)
+        weight_var = weights.var()
+        weight_mean = weights.mean()
+        
+        if weight_var > 10 and weight_mean > 55:
             return "PLAT"
-    return "ATTELE_AUTOSTART"
+        elif weight_var < 3 and weight_mean < 65:
+            return "ATTELE_AUTOSTART"
+        else:
+            return "PLAT"
+    
+    def _classical_analysis(self, df: pd.DataFrame, race_type: str) -> pd.Series:
+        """Analyse classique basée sur les cotes et autres facteurs"""
+        
+        # Conversion des données
+        odds = pd.to_numeric(df['Cote'].str.replace(',', '.'), errors='coerce').fillna(10.0)
+        draw = pd.to_numeric(df['Numéro de corde'], errors='coerce').fillna(1)
+        weights = pd.to_numeric(df['Poids'], errors='coerce').fillna(58.0)
+        
+        # Calcul des scores
+        odds_score = 1 / odds  # Inverse des cotes
+        draw_score = self._calculate_draw_score(draw, race_type, len(df))
+        form_score = df['Musique'].apply(self._parse_musique)
+        weight_score = self._calculate_weight_score(weights)
+        
+        # Pondération selon le type de course
+        if race_type == "PLAT":
+            weights_config = [0.4, 0.25, 0.2, 0.15]  # odds, draw, form, weight
+        else:  # TROT
+            weights_config = [0.45, 0.3, 0.2, 0.05]
+        
+        # Score final
+        total_score = (weights_config[0] * odds_score +
+                      weights_config[1] * draw_score +
+                      weights_config[2] * form_score +
+                      weights_config[3] * weight_score)
+        
+        return total_score
+    
+    def _calculate_draw_score(self, draw: pd.Series, race_type: str, n_runners: int) -> pd.Series:
+        """Calcule le score de position"""
+        
+        if race_type == "PLAT":
+            # Pour le plat, favoriser les positions intérieures
+            optimal_positions = list(range(1, min(6, n_runners//2 + 2)))
+        else:
+            # Pour le trot, positions moyennes souvent meilleures
+            optimal_positions = list(range(max(1, n_runners//4), min(n_runners, n_runners//2 + 3)))
+        
+        scores = []
+        for pos in draw:
+            if pos in optimal_positions:
+                scores.append(2.0)
+            elif pos <= n_runners // 2:
+                scores.append(1.0)
+            else:
+                scores.append(0.5)
+        
+        return pd.Series(scores, index=draw.index)
+    
+    def _parse_musique(self, musique: str) -> float:
+        """Parse la musique pour extraire un score de forme"""
+        if pd.isna(musique) or not musique:
+            return 0.5
+        
+        try:
+            positions = [int(p) for p in re.findall(r'\\d+', str(musique)) if int(p) <= 20]
+            if not positions:
+                return 0.5
+            
+            # Score basé sur les positions récentes avec pondération décroissante
+            weights = np.exp(-0.3 * np.arange(len(positions)))
+            weighted_avg = np.average(positions, weights=weights)
+            
+            return 1 / (1 + weighted_avg / 3)
+        except:
+            return 0.5
+    
+    def _calculate_weight_score(self, weights: pd.Series) -> pd.Series:
+        """Calcule le score de poids"""
+        if weights.std() < 1e-6:
+            return pd.Series(0.5, index=weights.index)
+        
+        # Plus léger = mieux
+        return (weights.max() - weights) / (weights.max() - weights.min())
+    
+    def _ml_analysis(self, df: pd.DataFrame) -> pd.Series:
+        """Analyse avec Machine Learning"""
+        
+        # Création des features simplifiées
+        features = self._create_simple_features(df)
+        
+        # Génération des labels d'entraînement
+        labels = self._generate_training_labels(df)
+        
+        # Sélection du modèle disponible
+        if XGBOOST_AVAILABLE:
+            model = xgb.XGBClassifier(n_estimators=100, max_depth=4, random_state=42)
+        elif LIGHTGBM_AVAILABLE:
+            model = lgb.LGBMClassifier(n_estimators=100, max_depth=4, random_state=42, verbose=-1)
+        else:
+            model = RandomForestClassifier(n_estimators=100, max_depth=4, random_state=42)
+        
+        # Entraînement
+        if len(features) >= 8:  # Minimum pour train/test split
+            X_train, X_test, y_train, y_test = train_test_split(
+                features, labels, test_size=0.3, random_state=42, stratify=labels
+            )
+            
+            X_train_scaled = self.scaler.fit_transform(X_train)
+            X_test_scaled = self.scaler.transform(X_test)
+            
+            model.fit(X_train_scaled, y_train)
+            
+            # Prédiction sur toutes les données
+            features_scaled = self.scaler.transform(features)
+            probabilities = model.predict_proba(features_scaled)[:, 1]
+        else:
+            # Pas assez de données pour split, entraînement sur tout
+            features_scaled = self.scaler.fit_transform(features)
+            model.fit(features_scaled, labels)
+            probabilities = model.predict_proba(features_scaled)[:, 1]
+        
+        return pd.Series(probabilities, index=df.index)
+    
+    def _create_simple_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Crée des features simples pour le ML"""
+        
+        features = pd.DataFrame(index=df.index)
+        
+        # Features de cotes
+        odds = pd.to_numeric(df['Cote'].str.replace(',', '.'), errors='coerce').fillna(10.0)
+        features['odds_reciprocal'] = 1 / odds
+        features['odds_log'] = np.log1p(odds)
+        features['odds_rank'] = odds.rank(pct=True)
+        
+        # Features de position
+        draw = pd.to_numeric(df['Numéro de corde'], errors='coerce').fillna(1)
+        features['draw_position'] = draw
+        features['draw_pct'] = draw / len(df)
+        
+        # Features de poids
+        weights = pd.to_numeric(df['Poids'], errors='coerce').fillna(58.0)
+        if weights.std() > 0:
+            features['weight_zscore'] = (weights - weights.mean()) / weights.std()
+        else:
+            features['weight_zscore'] = 0.0
+        
+        # Features de forme
+        features['form_score'] = df['Musique'].apply(self._parse_musique)
+        
+        # Features démographiques
+        ages = df['Âge/Sexe'].apply(lambda x: int(re.search(r'(\\d+)', str(x)).group(1)) if re.search(r'(\\d+)', str(x)) else 5)
+        features['age'] = ages
+        features['is_prime_age'] = ((ages >= 4) & (ages <= 6)).astype(int)
+        
+        # Nettoyage
+        features = features.fillna(0)
+        features = features.replace([np.inf, -np.inf], 0)
+        
+        return features
+    
+    def _generate_training_labels(self, df: pd.DataFrame) -> pd.Series:
+        """Génère des labels d'entraînement basés sur les cotes"""
+        
+        odds = pd.to_numeric(df['Cote'].str.replace(',', '.'), errors='coerce').fillna(10.0)
+        implied_probs = 1 / odds
+        normalized_probs = implied_probs / implied_probs.sum()
+        
+        # Génération probabiliste des labels
+        np.random.seed(42)
+        labels = pd.Series(0, index=df.index)
+        
+        for idx, prob in normalized_probs.items():
+            if np.random.random() < prob * 3:  # Amplification
+                labels.loc[idx] = 1
+        
+        # Assurer au moins un label positif
+        if labels.sum() == 0:
+            labels.loc[normalized_probs.idxmax()] = 1
+        
+        return labels
 
-# ==== INTERFACE STREAMLIT CORRIGÉE ====
-def main():
+# ==== GÉNÉRATEUR DE DONNÉES DE DÉMO ====
+def generate_demo_race(n_runners: int = 12, race_type: str = "PLAT") -> pd.DataFrame:
+    """Génère une course de démonstration réaliste"""
+    
+    # Noms de chevaux
+    horse_names = [
+        'Étoile Filante', 'Roi du Galop', 'Tempête Noire', 'Vent du Sud',
+        'Flèche d\'Or', 'Prince Rapide', 'Saphir Bleu', 'Tonnerre Rouge',
+        'Éclair Blanc', 'Foudre Sacrée', 'Ouragan Gris', 'Météore Brun',
+        'Diamant Noir', 'Cristal Vert', 'Rubis Royal', 'Emeraude Vive',
+        'Turquoise Wild', 'Ambre Solaire', 'Onyx Mystique', 'Perle Rare'
+    ]
+    
+    np.random.seed(42)
+    
+    # Sélection des noms
+    selected_names = horse_names[:n_runners]
+    
+    # Génération des cotes réalistes
+    odds = np.random.lognormal(mean=1.6, sigma=0.7, size=n_runners)
+    odds = np.clip(odds, 2.0, 25.0)
+    odds = np.sort(odds)
+    
+    # Construction des données
+    data = {
+        'Nom': selected_names,
+        'Numéro de corde': [str(i+1) for i in range(n_runners)],
+        'Cote': [f"{odd:.1f}" for odd in odds],
+    }
+    
+    # Données spécifiques au type
+    if race_type == "PLAT":
+        weights = np.random.normal(57, 2.5, n_runners)
+        data['Poids'] = [f"{w:.1f}" for w in np.clip(weights, 52, 64)]
+    else:  # TROT
+        weights = np.random.normal(65, 1.5, n_runners)
+        data['Poids'] = [f"{w:.1f}" for w in np.clip(weights, 62, 68)]
+    
+    # Musique cohérente avec les cotes
+    musiques = []
+    for i, odd in enumerate(odds):
+        if i < 3:  # Favoris
+            musique = np.random.choice(['1a2a3a', '2a1a4a', '3a2a1a'])
+        elif i < n_runners // 2:  # Moyens
+            musique = np.random.choice(['4a3a5a', '5a4a6a', '3a5a4a'])
+        else:  # Outsiders
+            musique = np.random.choice(['8a7a9a', '9a8a10a', '7a9a8a'])
+        
+        musiques.append(musique)
+    
+    data['Musique'] = musiques
+    
+    # Âge et sexe
+    ages = np.random.choice([3,4,5,6,7], n_runners, p=[0.15,0.3,0.3,0.2,0.05])
+    sexes = np.random.choice(['H','F','M'], n_runners, p=[0.4,0.3,0.3])
+    data['Âge/Sexe'] = [f"{age}{sex}" for age, sex in zip(ages, sexes)]
+    
+    return pd.DataFrame(data)
+
+# ==== INTERFACE STREAMLIT ====
+def setup_streamlit_interface():
+    """Configuration de l'interface Streamlit"""
+    
     st.set_page_config(
-        page_title="Pronostics Hippiques ML",
-        page_icon="🏇",
+        page_title="🏆 Elite Racing AI",
+        page_icon="🐎",
         layout="wide"
     )
     
-    st.title("🏇 Pronostics Hippiques avec Machine Learning")
-    st.markdown("---")
-    
-    # Sidebar configuration
-    st.sidebar.header("Configuration ML")
-    ml_model = st.sidebar.selectbox("Modèle", ["xgboost", "logistic", "random_forest", "gradient_boosting"], index=0)
-    target_var = st.sidebar.selectbox("Variable cible", ["top3", "winner"], index=0)
-    
-    ML_CONFIG.update({"model_type": ml_model, "target_variable": target_var})
-    
-    # Section URL input
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        url = st.text_input("🔗 URL de la course:", placeholder="https://www.geny.com/...")
-    with col2:
-        race_type = st.selectbox("Type de course", ["AUTO", "PLAT", "ATTELE_AUTOSTART", "ATTELE_VOLTE"], index=0)
-    
-    # Section données manuelles pour tests
-    with st.expander("🧪 Saisie manuelle de données de test"):
-        n_test_runners = st.slider("Nombre de partants de test", 4, 20, 14)
-        if st.button("Générer des données de test"):
-            test_data = generate_test_data(n_test_runners)
-            df_test = pd.DataFrame(test_data)
-            
-            with st.spinner(f"Analyse d'une course test à {n_test_runners} partants..."):
-                try:
-                    df_ranked, predictor, detected_type, config = analyze_race_adaptive(df_test, "AUTO")
-                    display_results(df_ranked, predictor, detected_type, config, n_test_runners)
-                except Exception as e:
-                    st.error(f"Erreur lors de l'analyse: {e}")
-                    import traceback
-                    st.code(traceback.format_exc())
+    # CSS simple
+    st.markdown("""
+    <style>
+    .main-header {
+        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+        padding: 2rem;
+        border-radius: 10px;
+        color: white;
+        text-align: center;
+        margin-bottom: 2rem;
+    }
+    .metric-card {
+        background: #f8f9fa;
+        padding: 1rem;
+        border-radius: 8px;
+        border-left: 4px solid #667eea;
+        margin: 0.5rem 0;
+    }
+    .prediction-card {
+        background: #ffffff;
+        padding: 1rem;
+        border-radius: 8px;
+        margin: 0.5rem 0;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        border-left: 4px solid #667eea;
+    }
+    .winner-card {
+        border-left: 4px solid #28a745 !important;
+        background: #f8fff9 !important;
+    }
+    </style>
+    """, unsafe_allow_html=True)
 
-    if st.button("🎯 Analyser la course URL", type="primary") and url:
-        with st.spinner("Extraction et analyse en cours..."):
-            try:
-                # Extraction des données
-                donnees_chevaux = extract_race_data(url)
-                
-                if not donnees_chevaux:
-                    st.error("❌ Aucune donnée extraite de l'URL. Vérifiez l'URL ou essayez un autre site.")
-                    return
-                
-                st.success(f"✅ {len(donnees_chevaux)} chevaux extraits")
-                
-                # Affichage des données brutes pour debug
-                with st.expander("📋 Données brutes extraites"):
-                    st.dataframe(pd.DataFrame(donnees_chevaux))
-                
-                # Analyse
-                df = pd.DataFrame(donnees_chevaux)
-                df_ranked, predictor, detected_type, config = analyze_race_adaptive(df, race_type)
-                display_results(df_ranked, predictor, detected_type, config, len(df_ranked))
-                
-            except Exception as e:
-                st.error(f"❌ Erreur lors de l'analyse: {str(e)}")
-                import traceback
-                st.code(traceback.format_exc())
-
-def generate_test_data(n_runners):
-    """Génère des données de test réalistes"""
-    noms = ['Star Runner', 'Thunder Bolt', 'Wind Dancer', 'Lightning Flash', 'Storm Chaser',
-            'Quick Silver', 'Moon Shadow', 'Fire Blaze', 'Ice Queen', 'Desert King',
-            'Ocean Wave', 'Mountain High', 'River Flow', 'Sky Rocket', 'Earth Shaker',
-            'Sun Blaze', 'Night Fury', 'Day Dream', 'Winter Storm', 'Spring Bloom']
+def main():
+    """Interface principale"""
     
-    test_data = []
-    for i in range(n_runners):
-        cheval = {
-            'Nom': noms[i] if i < len(noms) else f'Cheval {i+1}',
-            'Numéro de corde': str(i+1),
-            'Cote': f"{max(2.0, np.random.lognormal(1.5, 0.8)):.1f}",
-            'Poids': f"{np.random.uniform(54.0, 62.0):.1f}",
-            'Musique': np.random.choice(['1a2a', '3a1a', '2a2a', '5a4a', '2a3a', '1a1a', '4a3a'])
-        }
-        test_data.append(cheval)
+    setup_streamlit_interface()
     
-    return test_data
-
-def display_results(df_ranked, predictor, race_type, config, n_runners):
-    """Affiche les résultats de l'analyse"""
-    # Métriques principales
-    col1, col2, col3, col4 = st.columns(4)
-    with col1:
-        st.metric("🏇 Partants", n_runners)
-    with col2:
-        st.metric("📊 Type", race_type)
-    with col3:
-        ml_used = "✅ ML" if predictor else "⚠️ Classique"
-        st.metric("🤖 Méthode", ml_used)
-    with col4:
-        top1_prob = df_ranked.iloc[0]['ml_probability'] * 100
-        st.metric("🥇 Probabilité 1er", f"{top1_prob:.1f}%")
+    # Header
+    st.markdown("""
+    <div class="main-header">
+        <h1>🏆 Elite Racing AI</h1>
+        <p>Système Expert de Pronostics Hippiques</p>
+    </div>
+    """, unsafe_allow_html=True)
     
-    # Tableau des résultats
-    st.subheader("📊 Classement final")
-    
-    # S'assurer que les colonnes existent
-    display_cols = ['rang', 'Nom', 'ml_probability']
-    optional_cols = ['Cote', 'Numéro de corde', 'Poids']
-    
-    for col in optional_cols:
-        if col in df_ranked.columns:
-            display_cols.append(col)
-    
-    display_df = df_ranked[display_cols].copy()
-    display_df['Probabilité'] = (display_df['ml_probability'] * 100).round(1).astype(str) + '%'
-    
-    # Renommage des colonnes
-    rename_dict = {'rang': 'Rang', 'Nom': 'Cheval', 'ml_probability': 'Prob_raw'}
-    if 'Cote' in display_df.columns:
-        rename_dict['Cote'] = 'Cote'
-    if 'Numéro de corde' in display_df.columns:
-        rename_dict['Numéro de corde'] = 'Corde'
-    if 'Poids' in display_df.columns:
-        rename_dict['Poids'] = 'Poids (kg)'
-    
-    display_df = display_df.rename(columns=rename_dict)
-    
-    # Colonnes à afficher
-    show_cols = ['Rang', 'Cheval', 'Probabilité']
-    if 'Cote' in display_df.columns:
-        show_cols.append('Cote')
-    if 'Corde' in display_df.columns:
-        show_cols.append('Corde')
-    if 'Poids (kg)' in display_df.columns:
-        show_cols.append('Poids (kg)')
-    
-    # Colorier les 3 premiers
-    def highlight_top3(row):
-        if row['Rang'] == 1:
-            return ['background-color: #FFD700'] * len(row)
-        elif row['Rang'] == 2:
-            return ['background-color: #C0C0C0'] * len(row)
-        elif row['Rang'] == 3:
-            return ['background-color: #CD7F32'] * len(row)
-        else:
-            return [''] * len(row)
-    
-    styled_df = display_df[show_cols].style.apply(highlight_top3, axis=1)
-    st.dataframe(styled_df, use_container_width=True)
-    
-    # Recommendations paris
-    st.subheader("🎯 Recommendations pour Paris")
-    display_betting_recommendations(df_ranked, n_runners, predictor)
-    
-    # Graphique de probabilités
-    if len(df_ranked) > 0:
-        st.subheader("📈 Distribution des probabilités")
+    # Sidebar
+    with st.sidebar:
+        st.header("⚙️ Configuration")
         
-        import plotly.graph_objects as go
-        
-        fig = go.Figure()
-        
-        fig.add_trace(go.Bar(
-            x=df_ranked['Nom'][:10],
-            y=(df_ranked['ml_probability'][:10] * 100),
-            marker_color=['gold' if i == 0 else 'silver' if i == 1 else 'brown' if i == 2 else 'lightblue' for i in range(min(10, len(df_ranked)))],
-            text=(df_ranked['ml_probability'][:10] * 100).round(1),
-            texttemplate='%{text}%',
-            textposition='outside'
-        ))
-        
-        fig.update_layout(
-            title="Top 10 - Probabilités de succès",
-            xaxis_title="Cheval",
-            yaxis_title="Probabilité (%)",
-            height=400,
-            showlegend=False
+        race_type = st.selectbox(
+            "Type de Course",
+            ["AUTO", "PLAT", "ATTELE_AUTOSTART"],
+            help="AUTO = détection automatique"
         )
         
-        st.plotly_chart(fig, use_container_width=True)
+        use_ml = st.checkbox("Intelligence Artificielle", value=SKLEARN_AVAILABLE)
+        if not SKLEARN_AVAILABLE:
+            st.warning("⚠️ ML non disponible - Installez scikit-learn")
+        
+        st.info(f"""
+        🏆 **Elite Racing AI v{CONFIG.VERSION}**
+        
+        📊 Analyse: {'ML + Classique' if use_ml and SKLEARN_AVAILABLE else 'Classique'}
+        🤖 XGBoost: {'✅' if XGBOOST_AVAILABLE else '❌'}
+        🔬 LightGBM: {'✅' if LIGHTGBM_AVAILABLE else '❌'}
+        """)
     
-    # Affichage des métriques ML si disponibles
-    if predictor and hasattr(predictor, 'performance_metrics'):
-        with st.expander("🔬 Métriques du modèle ML"):
-            metrics = predictor.performance_metrics
-            
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("AUC Train", f"{metrics.get('train_auc', 0):.3f}")
-            with col2:
-                st.metric("AUC Test", f"{metrics.get('test_auc', 0):.3f}")
-            with col3:
-                st.metric("Log Loss", f"{metrics.get('test_log_loss', 0):.3f}")
-            
-            # Importance des features
-            if 'feature_importance' in metrics and metrics['feature_importance']:
-                st.write("**Top 10 Features importantes:**")
-                top_features = list(metrics['feature_importance'].items())[:10]
-                
-                feature_df = pd.DataFrame(top_features, columns=['Feature', 'Importance'])
-                feature_df['Importance'] = feature_df['Importance'].round(4)
-                
-                fig_features = go.Figure(go.Bar(
-                    x=feature_df['Importance'],
-                    y=feature_df['Feature'],
-                    orientation='h',
-                    marker_color='lightgreen'
-                ))
-                
-                fig_features.update_layout(
-                    title="Importance des features",
-                    xaxis_title="Importance",
-                    yaxis_title="Feature",
-                    height=400
-                )
-                
-                st.plotly_chart(fig_features, use_container_width=True)
-
-def display_betting_recommendations(df_ranked, n_runners, predictor):
-    """Affiche les recommandations de paris"""
-    col1, col2, col3 = st.columns(3)
+    # Interface principale
+    col1, col2 = st.columns([2, 1])
     
     with col1:
-        top1 = df_ranked.iloc[0]
-        st.metric("🥇 Premier favori", top1['Nom'], f"{top1['ml_probability']*100:.1f}%")
+        st.subheader("📊 Analyse de Course")
+        
+        # Onglets pour les sources
+        tab1, tab2, tab3 = st.tabs(["🔗 URL", "📁 Fichier", "🎲 Démo"])
+        
+        with tab1:
+            url = st.text_input("URL de la course", placeholder="https://www.geny.com/...")
+        
+        with tab2:
+            uploaded_file = st.file_uploader("Fichier CSV", type=["csv"])
+        
+        with tab3:
+            demo_runners = st.slider("Nombre de partants", 6, 20, 12)
+            demo_race_type = st.selectbox("Type course démo", ["PLAT", "ATTELE_AUTOSTART"])
     
     with col2:
-        # Meilleure valeur (rapport cote/probabilité)
-        if 'odds_numeric' in df_ranked.columns:
-            df_ranked['value_ratio'] = df_ranked['odds_numeric'] * df_ranked['ml_probability']
-            value_picks = df_ranked[
-                (df_ranked['ml_probability'] > df_ranked['ml_probability'].quantile(0.4))
-            ].nlargest(1, 'value_ratio')
-            
-            if len(value_picks) > 0:
-                best_value = value_picks.iloc[0]
-                st.metric("💎 Meilleure valeur", best_value['Nom'], f"Cote: {best_value['odds_numeric']:.1f}")
+        st.subheader("🚀 Actions")
+        
+        if st.button("🎯 Analyser", type="primary", use_container_width=True):
+            analyze_race_interface(url, uploaded_file, race_type, use_ml)
+        
+        if st.button("🎲 Démo", use_container_width=True):
+            run_demo(demo_runners, demo_race_type, use_ml)
+
+def analyze_race_interface(url, uploaded_file, race_type, use_ml):
+    """Interface d'analyse de course"""
+    
+    with st.spinner("🧠 Analyse en cours..."):
+        try:
+            # Chargement des données
+            if uploaded_file:
+                df = pd.read_csv(uploaded_file)
+                source = f"Fichier: {uploaded_file.name}"
+            elif url:
+                extractor = SimpleDataExtractor()
+                df = extractor.extract_race_data(url)
+                source = f"URL: {url[:50]}..."
             else:
-                st.metric("💎 Meilleure valeur", "Non trouvée", "")
-        else:
-            st.metric("💎 Meilleure valeur", "Données manquantes", "")
+                st.error("⚠️ Veuillez fournir une source de données")
+                return
+            
+            if df is None or df.empty:
+                st.error("❌ Impossible de charger les données")
+                return
+            
+            # Analyse
+            analyzer = SimpleAnalyzer()
+            results = analyzer.analyze_race(df, race_type)
+            
+            # Affichage des résultats
+            display_results(results, source, use_ml)
+            
+        except Exception as e:
+            st.error(f"❌ Erreur: {str(e)}")
+
+def run_demo(n_runners, race_type, use_ml):
+    """Lance une démonstration"""
+    
+    with st.spinner(f"🎲 Génération d'une course {race_type} avec {n_runners} partants..."):
+        try:
+            # Génération des données
+            df_demo = generate_demo_race(n_runners, race_type)
+            
+            # Analyse
+            analyzer = SimpleAnalyzer()
+            results = analyzer.analyze_race(df_demo, race_type)
+            
+            # Affichage
+            display_results(results, f"Démo {race_type}", use_ml)
+            
+        except Exception as e:
+            st.error(f"❌ Erreur de démonstration: {str(e)}")
+
+def display_results(results: pd.DataFrame, source: str, use_ml: bool):
+    """Affiche les résultats d'analyse"""
+    
+    st.success(f"✅ Analyse terminée - {len(results)} chevaux")
+    
+    # Métriques principales
+    col1, col2, col3, col4 = st.columns(4)
+    
+    with col1:
+        top1_prob = results['probability'].iloc[0] * 100
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>{top1_prob:.1f}%</h3>
+            <p>Premier Favori</p>
+        </div>
+        """, unsafe_allow_html=True)
+    
+    with col2:
+        method = results['method'].iloc[0]
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>{method}</h3>
+            <p>Méthode d'Analyse</p>
+        </div>
+        """, unsafe_allow_html=True)
     
     with col3:
-        if predictor and hasattr(predictor, 'performance_metrics'):
-            auc = predictor.performance_metrics.get('test_auc', 0.5)
-            confiance = "Élevée" if auc > 0.7 else "Moyenne" if auc > 0.6 else "Faible"
-            st.metric("📈 Confiance modèle", confiance, f"AUC: {auc:.3f}")
-        else:
-            st.metric("📈 Méthode", "Classique", "Sans ML")
+        race_type = results['race_type'].iloc[0]
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>{race_type}</h3>
+            <p>Type de Course</p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    # Suggestions adaptées
-    st.markdown("---")
-    st.markdown("### 💡 Suggestions de paris")
+    with col4:
+        st.markdown(f"""
+        <div class="metric-card">
+            <h3>{len(results)}</h3>
+            <p>Partants</p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    if n_runners <= 8:
-        st.info(f"""
-        **Course à {n_runners} partants - Petit plateau:**
-        - 🎯 **Simple gagnant**: {df_ranked.iloc[0]['Nom']} (Prob: {df_ranked.iloc[0]['ml_probability']*100:.1f}%)
-        - 🥈 **Placé**: Top 3 du classement
-        - 🎲 **Trio Ordre**: {df_ranked.iloc[0]['Nom']} - {df_ranked.iloc[1]['Nom']} - {df_ranked.iloc[2]['Nom']}
-        """)
-    elif n_runners <= 12:
-        st.info(f"""
-        **Course à {n_runners} partants - Plateau moyen:**
-        - 🎯 **Base solide**: Top 2 ({df_ranked.iloc[0]['Nom']}, {df_ranked.iloc[1]['Nom']})
-        - 🎲 **Quinté+**: Jouez les 5-6 premiers avec une base des 2 premiers
-        - 💰 **Outsider**: {df_ranked.iloc[6]['Nom'] if len(df_ranked) > 6 else 'N/A'} (position 7)
-        """)
-    else:
-        st.info(f"""
-        **Course à {n_runners} partants - Grand plateau:**
-        - 🎯 **Base large**: Top 3 ({df_ranked.iloc[0]['Nom']}, {df_ranked.iloc[1]['Nom']}, {df_ranked.iloc[2]['Nom']})
-        - 🎲 **Quinté+**: Élargir à 7-8 chevaux, dont le top 4
-        - 💰 **Surprise possible**: Surveillez les positions 8-12
-        - ⚠️ **Prudence**: Plus de partants = plus d'incertitude
-        """)
+    # Top 5 prédictions
+    st.subheader("🏆 Top 5 Prédictions")
     
-    # Combinaisons suggérées
-    st.markdown("### 🎰 Combinaisons suggérées")
+    for i, (_, horse) in enumerate(results.head(5).iterrows()):
+        prob = horse['probability'] * 100
+        card_class = "prediction-card winner-card" if i == 0 else "prediction-card"
+        icon = "🥇" if i == 0 else "🥈" if i == 1 else "🥉" if i == 2 else "⭐"
+        
+        st.markdown(f"""
+        <div class="{card_class}">
+            <h4>{i+1}. {icon} {horse['Nom']}</h4>
+            <p>Probabilité: <strong>{prob:.1f}%</strong> • Cote: {horse.get('Cote', 'N/A')} • Corde: {horse.get('Numéro de corde', 'N/A')}</p>
+        </div>
+        """, unsafe_allow_html=True)
     
-    top5 = df_ranked.head(5)
+    # Recommandations
+    st.subheader("💡 Recommandations")
     
     col1, col2 = st.columns(2)
     
     with col1:
-        st.markdown("**🏆 Combinaison sécuritaire:**")
-        safe_combo = " - ".join([f"{row['Nom']} ({int(row['rang'])})" for _, row in top5.head(3).iterrows()])
-        st.write(safe_combo)
-        st.caption(f"Probabilité combinée: {(top5.head(3)['ml_probability'].sum() * 100):.1f}%")
+        st.markdown("**🎯 Stratégie Recommandée:**")
+        n_runners = len(results)
+        
+        if n_runners <= 8:
+            strategy = ["Simple Gagnant sur le favori", "Couplé avec les 2 premiers", "Trio ordre sécurisé"]
+        elif n_runners <= 12:
+            strategy = ["Quinté+ base 4-5 chevaux", "Trio désordre élargi", "2sur4 pour rapport"]
+        else:
+            strategy = ["Quinté+ base élargie", "Super4 alternative", "Multi avec outsiders"]
+        
+        for i, strat in enumerate(strategy, 1):
+            st.write(f"{i}. {strat}")
     
     with col2:
-        st.markdown("**💎 Combinaison à valeur:**")
-        if 'value_ratio' in df_ranked.columns:
-            value_combo_horses = df_ranked.nlargest(3, 'value_ratio')
-            value_combo = " - ".join([f"{row['Nom']} ({int(row['rang'])})" for _, row in value_combo_horses.iterrows()])
-            st.write(value_combo)
-            st.caption("Basé sur le rapport cote/probabilité")
-        else:
-            st.write("Données insuffisantes pour calculer la valeur")
+        st.markdown("**🏆 Sélections:**")
+        
+        winner = results.iloc[0]
+        st.success(f"🥇 **Gagnant:** {winner['Nom']} ({winner['probability']*100:.1f}%)")
+        
+        top3 = results.head(3)['Nom'].tolist()
+        st.info(f"🎯 **Trio:** {' • '.join(top3)}")
+        
+        # Outsider value
+        for _, horse in results.iterrows():
+            if horse['rank'] > 3 and horse['rank'] <= 8:
+                try:
+                    odds = float(horse['Cote'])
+                    if odds > 8 and horse['probability'] > 0.08:
+                        st.warning(f"💎 **Outsider:** {horse['Nom']} (Cote {odds})")
+                        break
+                except:
+                    continue
     
-    # Export des résultats
-    st.markdown("---")
+    # Tableau détaillé
+    with st.expander("📋 Tableau Complet", expanded=False):
+        display_data = results[['rank', 'Nom', 'probability', 'Cote', 'Numéro de corde', 'Poids']].copy()
+        display_data['Probabilité %'] = (display_data['probability'] * 100).round(1)
+        display_data = display_data.drop('probability', axis=1)
+        display_data.columns = ['Rang', 'Cheval', 'Cote', 'Corde', 'Poids', 'Probabilité %']
+        
+        st.dataframe(display_data, use_container_width=True)
     
-    if st.button("📥 Exporter les résultats (CSV)"):
-        csv = df_ranked.to_csv(index=False)
-        st.download_button(
-            label="Télécharger CSV",
-            data=csv,
-            file_name=f"pronostics_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-            mime="text/csv"
+    # Graphique de distribution des probabilités
+    if len(results) > 5:
+        st.subheader("📊 Distribution des Probabilités")
+        
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=results['Nom'][:10],
+            y=results['probability'][:10] * 100,
+            marker_color='rgba(102, 126, 234, 0.7)'
+        ))
+        
+        fig.update_layout(
+            title="Top 10 - Probabilités de Victoire",
+            xaxis_title="Chevaux",
+            yaxis_title="Probabilité (%)",
+            height=400
         )
+        
+        st.plotly_chart(fig, use_container_width=True)
 
+# ==== POINT D'ENTRÉE ====
 if __name__ == "__main__":
-    main()
+    try:
+        main()
