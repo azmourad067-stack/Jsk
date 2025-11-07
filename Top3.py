@@ -1,47 +1,4 @@
-# Project: AI Horse Racing Predictor - Modular Refactor (Local)
-# Layout: src/ (modules) + run.py + requirements.txt
 
-"""
-This single-file package textdoc contains multiple Python modules separated by
-"### FILE: <path>" markers. Save each section into the indicated path to build
-the project locally.
-
-Selected options:
-1) Split modules
-2) Advanced caching (joblib.Memory + st.cache_resource)
-3) AutoML (Optuna hyperparameter tuning)
-4) Skip SHAP
-5) Local use
-
-How to use:
-- Create a folder (e.g. `deep_race_app`) and save each "### FILE" block to that path.
-- Create a virtualenv and `pip install -r requirements.txt`.
-- Run `python run.py` to start the Streamlit app locally: `streamlit run run.py`.
-
-"""
-
-###############################################################################
-### FILE: requirements.txt
-###############################################################################
-# core
-
-
-###############################################################################
-### FILE: run.py
-###############################################################################
-from src.ui import main
-
-if __name__ == "__main__":
-    main()
-
-###############################################################################
-### FILE: src/__init__.py
-###############################################################################
-# Package init
-
-###############################################################################
-### FILE: src/config.py
-###############################################################################
 from dataclasses import dataclass
 
 @dataclass
