@@ -776,5 +776,4 @@ def display_results(results: pd.DataFrame, source: str, use_ml: bool):
 
 # ==== POINT D'ENTRÉE ====
 if __name__ == "__main__":
-    try:
         main()
