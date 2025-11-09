@@ -21,12 +21,12 @@ class PerformanceBasedConfig:
     def __init__(self):
         self.performance_weights = {
             "PLAT": {
-                "recent_performance": 0.35,      # Musique/performances récentes
-                "consistency": 0.20,             # Régularité
-                "draw_position": 0.15,           # Position de corde
-                "weight_handicap": 0.15,         # Handicap poids
-                "jockey_trainer": 0.10,          # Statistiques jockey/entraîneur
-                "course_specialization": 0.05    # Spécialisation hippodrome
+                "recent_performance": 0.35,
+                "consistency": 0.20,
+                "draw_position": 0.15,
+                "weight_handicap": 0.15,
+                "jockey_trainer": 0.10,
+                "course_specialization": 0.05
             },
             "ATTELE_AUTOSTART": {
                 "recent_performance": 0.40,
@@ -41,13 +41,6 @@ class PerformanceBasedConfig:
                 "driver_stats": 0.15,
                 "trainer_stats": 0.10
             }
-        }
-        
-        self.performance_thresholds = {
-            "excellent": 0.8,
-            "good": 0.6,
-            "average": 0.4,
-            "poor": 0.2
         }
 
 # ==== ANALYSEUR DE PERFORMANCE AVANCÉ ====
@@ -72,18 +65,21 @@ class PerformanceAnalyzer:
             
             # Tendance (amélioration ou détérioration)
             if len(positions) >= 2:
-                recent_trend = positions[-1] - positions[0]  # Négatif = amélioration
-                trend_strength = abs(recent_trend) / max(positions)
+                recent_trend = positions[-1] - positions[0]
+                trend_strength = abs(recent_trend) / max(positions) if max(positions) > 0 else 0
                 trend = "improving" if recent_trend < 0 else "declining" if recent_trend > 0 else "stable"
             else:
                 trend = "neutral"
                 trend_strength = 0
             
             # Consistance (plus faible variance = mieux)
-            consistency = 1 / (1 + np.var(positions)) if len(positions) > 1 else 0.5
+            if len(positions) > 1:
+                consistency = 1 / (1 + np.var(positions))
+            else:
+                consistency = 0.5
             
             return {
-                "score": min(avg_score * 2, 1.0),  # Normalisation
+                "score": min(avg_score * 2, 1.0),
                 "trend": trend,
                 "trend_strength": trend_strength,
                 "consistency": consistency,
@@ -95,6 +91,9 @@ class PerformanceAnalyzer:
     
     def calculate_draw_advantage(self, draw_number, total_runners, race_type):
         """Calcule l'avantage de la position sans considérer les cotes"""
+        draw_number = int(draw_number)  # Assurer que c'est un entier
+        total_runners = int(total_runners)  # Assurer que c'est un entier
+        
         if race_type == "PLAT":
             # En plat: cordes 1-4 avantageuses
             optimal_draws = list(range(1, min(5, total_runners + 1)))
@@ -111,37 +110,42 @@ class PerformanceAnalyzer:
             if draw_number in optimal_draws:
                 return 1.0
             elif 1 <= draw_number <= 3:
-                return 0.3  # Risque d'enfermement
+                return 0.3
             elif draw_number >= 10:
-                return 0.2  # Deuxième ligne
+                return 0.2
             else:
                 return 0.6
                 
         else:  # ATTELE_VOLTE
-            return 0.5  # Neutre
+            return 0.5
     
     def analyze_weight_handicap(self, weight, race_type, avg_weight=None):
         """Analyse l'impact du poids/handicap"""
+        # S'assurer que weight est un float
+        try:
+            weight_float = float(weight)
+        except (ValueError, TypeError):
+            weight_float = 60.0
+            
         if race_type == "PLAT":
             # En plat, le poids est crucial
             if avg_weight is None:
                 avg_weight = 57.0
-            weight_diff = avg_weight - weight
-            # Plus léger = mieux (dans une certaine mesure)
+            weight_diff = avg_weight - weight_float
+            # Plus léger = mieux
             advantage = max(0, min(1, (weight_diff + 5) / 10))
             return advantage
         else:
             # En attelé, poids standardisé
             return 0.5
     
-    def calculate_jockey_stats(self, jockey_name, historical_data=None):
+    def calculate_jockey_stats(self, jockey_name):
         """Calcule les statistiques du jockey/driver"""
-        # En production, on utiliserait des données historiques
-        # Pour l'instant, simulation basée sur le nom
-        if historical_data and jockey_name in historical_data:
-            return historical_data[jockey_name]
-        else:
-            # Simulation aléatoire mais cohérente
+        # Simulation basée sur le nom pour la démo
+        if not jockey_name or pd.isna(jockey_name):
+            return {"win_rate": 0.2, "place_rate": 0.4, "recent_form": 0.5}
+            
+        try:
             seed_value = sum(ord(c) for c in str(jockey_name)) % 100
             np.random.seed(seed_value)
             return {
@@ -149,6 +153,8 @@ class PerformanceAnalyzer:
                 "place_rate": np.random.uniform(0.2, 0.5),
                 "recent_form": np.random.uniform(0.3, 0.8)
             }
+        except:
+            return {"win_rate": 0.2, "place_rate": 0.4, "recent_form": 0.5}
 
 # ==== SYSTÈME DE PRÉDICTION BASÉ SUR LA PERFORMANCE ====
 class PerformanceBasedPredictor:
@@ -165,49 +171,60 @@ class PerformanceBasedPredictor:
         
         # 1. Features de performance récente
         performance_data = df['Musique'].apply(self.analyzer.analyze_musique)
-        features['recent_perf_score'] = performance_data.apply(lambda x: x['score'])
-        features['performance_trend'] = performance_data.apply(
-            lambda x: 1 if x['trend'] == 'improving' else (-1 if x['trend'] == 'declining' else 0)
-        )
-        features['consistency_score'] = performance_data.apply(lambda x: x['consistency'])
-        features['last_race_position'] = performance_data.apply(lambda x: x['last_race'])
+        features['recent_perf_score'] = [x['score'] for x in performance_data]
+        features['performance_trend'] = [
+            1 if x['trend'] == 'improving' else (-1 if x['trend'] == 'declining' else 0) 
+            for x in performance_data
+        ]
+        features['consistency_score'] = [x['consistency'] for x in performance_data]
+        features['last_race_position'] = [x['last_race'] for x in performance_data]
         
         # 2. Features de position
-        features['draw_advantage'] = df.apply(
-            lambda row: self.analyzer.calculate_draw_advantage(
-                row['draw_numeric'], n_runners, race_type
-            ), axis=1
-        )
-        features['draw_sector'] = pd.cut(
-            df['draw_numeric'], 
-            bins=[0, n_runners//3, 2*n_runners//3, n_runners+1], 
-            labels=[1, 2, 3]
-        ).astype(int)
+        features['draw_advantage'] = [
+            self.analyzer.calculate_draw_advantage(row['draw_numeric'], n_runners, race_type)
+            for _, row in df.iterrows()
+        ]
+        
+        # Créer des secteurs de corde
+        draw_bins = [0, n_runners//3, 2*n_runners//3, n_runners+1]
+        draw_labels = [1, 2, 3]
+        if n_runners > 0:
+            features['draw_sector'] = pd.cut(df['draw_numeric'], bins=draw_bins, labels=draw_labels).astype(int)
+        else:
+            features['draw_sector'] = [2] * len(df)
         
         # 3. Features de poids/handicap
         if 'weight_kg' in df.columns:
-            avg_weight = df['weight_kg'].mean()
-            features['weight_advantage'] = df['weight_kg'].apply(
-                lambda w: self.analyzer.analyze_weight_handicap(w, race_type, avg_weight)
-            )
+            # Calculer la moyenne du poids une seule fois
+            avg_weight = df['weight_kg'].mean() if len(df) > 0 else 60.0
+            features['weight_advantage'] = [
+                self.analyzer.analyze_weight_handicap(w, race_type, avg_weight) 
+                for w in df['weight_kg']
+            ]
         else:
-            features['weight_advantage'] = 0.5
+            features['weight_advantage'] = [0.5] * len(df)
         
-        # 4. Features de spécialisation (simulées)
-        features['specialization_score'] = np.random.uniform(0.3, 0.8, len(df))
+        # 4. Features de spécialisation
+        features['specialization_score'] = np.random.uniform(0.3, 0.8, len(df)).tolist()
         
-        # 5. Statistiques jockey/entraîneur (simulées)
-        features['jockey_skill'] = df['Jockey'].apply(
-            lambda x: self.analyzer.calculate_jockey_stats(x)['win_rate']
-        )
-        features['trainer_skill'] = df['Entraîneur'].apply(
-            lambda x: self.analyzer.calculate_jockey_stats(x)['win_rate']
-        )
+        # 5. Statistiques jockey/entraîneur
+        features['jockey_skill'] = [
+            self.analyzer.calculate_jockey_stats(x)['win_rate'] 
+            for x in df['Jockey']
+        ]
+        features['trainer_skill'] = [
+            self.analyzer.calculate_jockey_stats(x)['win_rate'] 
+            for x in df['Entraîneur']
+        ]
         
-        # Conversion en DataFrame
+        # Conversion en DataFrame avec gestion des types
         features_df = pd.DataFrame(features)
         
-        # Nettoyage
+        # S'assurer que toutes les colonnes sont numériques
+        for col in features_df.columns:
+            features_df[col] = pd.to_numeric(features_df[col], errors='coerce')
+        
+        # Nettoyage final
         features_df = features_df.fillna(0.5)
         
         return features_df
@@ -217,16 +234,35 @@ class PerformanceBasedPredictor:
         features_df = self.create_performance_features(df, race_type)
         weights = self.config.performance_weights[race_type]
         
-        # Application des pondérations
-        score = (
-            weights["recent_performance"] * features_df['recent_perf_score'] +
-            weights["consistency"] * features_df['consistency_score'] +
-            weights["draw_position"] * features_df['draw_advantage'] +
-            weights.get("weight_handicap", 0) * features_df.get('weight_advantage', 0.5) +
-            weights.get("jockey_trainer", 0) * (
-                features_df['jockey_skill'] + features_df['trainer_skill']
-            ) / 2
-        )
+        # Application des pondérations avec gestion sécurisée
+        score_components = []
+        
+        # Performance récente
+        if 'recent_perf_score' in features_df.columns:
+            score_components.append(weights["recent_performance"] * features_df['recent_perf_score'])
+        
+        # Consistance
+        if 'consistency_score' in features_df.columns:
+            score_components.append(weights["consistency"] * features_df['consistency_score'])
+        
+        # Position
+        if 'draw_advantage' in features_df.columns:
+            score_components.append(weights["draw_position"] * features_df['draw_advantage'])
+        
+        # Poids
+        if 'weight_advantage' in features_df.columns and "weight_handicap" in weights:
+            score_components.append(weights["weight_handicap"] * features_df['weight_advantage'])
+        
+        # Jockey/entraîneur
+        if 'jockey_skill' in features_df.columns and 'trainer_skill' in features_df.columns and "jockey_trainer" in weights:
+            jockey_trainer_score = (features_df['jockey_skill'] + features_df['trainer_skill']) / 2
+            score_components.append(weights["jockey_trainer"] * jockey_trainer_score)
+        
+        # Calcul du score final
+        if score_components:
+            score = sum(score_components)
+        else:
+            score = pd.Series([0.5] * len(df))
         
         return score, features_df
     
@@ -234,6 +270,10 @@ class PerformanceBasedPredictor:
         """Entraîne un modèle basé sur les performances"""
         if len(features) < 8:
             return None
+            
+        # S'assurer que les données sont numériques
+        features = features.astype(float)
+        labels = labels.astype(int)
             
         X_train, X_test, y_train, y_test = train_test_split(
             features, labels, test_size=0.25, random_state=42, stratify=labels
@@ -257,7 +297,7 @@ class PerformanceBasedPredictor:
         test_probs = self.model.predict_proba(X_test_scaled)[:, 1]
         
         metrics = {
-            'train_auc': roc_auc_score(y_train, train_probs),
+            'train_auc': roc_auc_score(y_train, train_probs) if len(np.unique(y_train)) > 1 else 0.5,
             'test_auc': roc_auc_score(y_test, test_probs) if len(np.unique(y_test)) > 1 else 0.5,
         }
         
@@ -269,14 +309,17 @@ class PerformanceBasedPredictor:
         
         # Utilise les données de performance pour créer des labels réalistes
         performance_data = df['Musique'].apply(self.analyzer.analyze_musique)
-        performance_scores = performance_data.apply(lambda x: x['score'])
+        performance_scores = [x['score'] for x in performance_data]
+        performance_series = pd.Series(performance_scores, index=df.index)
         
         # Les meilleures performances ont plus de chance d'être labellisées positives
-        top_performers = performance_scores.nlargest(min(3, n_runners // 2)).index
-        
-        for idx in top_performers:
-            if np.random.random() < 0.7:  # 70% de chance pour les tops
-                labels.loc[idx] = 1
+        top_k = min(3, max(1, n_runners // 2))
+        if top_k > 0:
+            top_performers = performance_series.nlargest(top_k).index
+            
+            for idx in top_performers:
+                if np.random.random() < 0.7:
+                    labels.loc[idx] = 1
         
         # Ajout aléatoire basé sur la consistance
         for idx, perf_data in performance_data.items():
@@ -299,12 +342,20 @@ class PerformanceBasedSystem:
         # Préparation des données
         df_clean = self.prepare_data(df)
         
+        if len(df_clean) == 0:
+            st.error("❌ Aucune donnée valide après nettoyage")
+            return None, None
+        
         # Détection du type de course
         if race_type == "AUTO":
             race_type = self.detect_race_type(df_clean)
         
         # Calcul du score de performance (sans cotes)
-        performance_score, features_df = self.predictor.calculate_performance_score(df_clean, race_type)
+        try:
+            performance_score, features_df = self.predictor.calculate_performance_score(df_clean, race_type)
+        except Exception as e:
+            st.error(f"❌ Erreur lors du calcul des performances: {e}")
+            return None, None
         
         # Machine Learning optionnel
         ml_probabilities = None
@@ -313,10 +364,11 @@ class PerformanceBasedSystem:
                 labels = self.predictor.create_performance_labels(df_clean, n_runners)
                 if sum(labels) >= 2:
                     metrics = self.predictor.train_performance_model(features_df, labels)
-                    if metrics and metrics['test_auc'] > 0.6:
+                    if metrics and metrics.get('test_auc', 0) > 0.6:
                         features_scaled = self.predictor.scaler.transform(features_df)
                         ml_probabilities = self.predictor.model.predict_proba(features_scaled)[:, 1]
-            except Exception:
+            except Exception as e:
+                st.warning(f"⚠️ ML non disponible: {e}")
                 ml_probabilities = None
         
         # Score final
@@ -348,14 +400,14 @@ class PerformanceBasedSystem:
         else:
             df_clean['weight_kg'] = 60.0
         
-        # Nettoyage final
+        # Nettoyage final - garder seulement les lignes avec Numéro de corde valide
         df_clean = df_clean.dropna(subset=['draw_numeric']).reset_index(drop=True)
         
         return df_clean
     
     def detect_race_type(self, df):
         """Détection du type de course"""
-        if 'weight_kg' not in df.columns:
+        if 'weight_kg' not in df.columns or len(df) == 0:
             return "ATTELE_AUTOSTART"
             
         weight_variation = df['weight_kg'].std()
@@ -367,15 +419,21 @@ class PerformanceBasedSystem:
     def prepare_results(self, df, scores, race_type, features_df):
         """Prépare les résultats finaux"""
         results = df.copy()
-        results['performance_score'] = scores
+        results['performance_score'] = scores.values if hasattr(scores, 'values') else scores
         
         # Normalisation pour probabilité
-        min_score = scores.min()
-        max_score = scores.max()
+        min_score = np.min(scores)
+        max_score = np.max(scores)
         if max_score > min_score:
             results['probability'] = (scores - min_score) / (max_score - min_score)
         else:
-            results['probability'] = 1.0 / len(results)
+            results['probability'] = [1.0 / len(results)] * len(results)
+        
+        # Ajouter les features importantes pour l'affichage
+        feature_columns = ['recent_perf_score', 'consistency_score', 'draw_advantage', 'weight_advantage']
+        for col in feature_columns:
+            if col in features_df.columns:
+                results[col] = features_df[col].values
         
         # Classement
         results = results.sort_values('performance_score', ascending=False)
@@ -385,12 +443,13 @@ class PerformanceBasedSystem:
         results['race_type'] = race_type
         results['analysis_method'] = "Performance-Based"
         
-        return results
+        return results.reset_index(drop=True)
 
     def safe_int_convert(self, value):
         """Conversion sécurisée en int"""
         try:
-            return int(re.search(r'\d+', str(value)).group())
+            match = re.search(r'\d+', str(value))
+            return int(match.group()) if match else 1
         except:
             return 1
     
@@ -398,7 +457,9 @@ class PerformanceBasedSystem:
         """Extraction du poids"""
         try:
             match = re.search(r'(\d+(?:[.,]\d+)?)', str(poids_str))
-            return float(match.group(1).replace(',', '.')) if match else 60.0
+            if match:
+                return float(match.group(1).replace(',', '.'))
+            return 60.0
         except:
             return 60.0
 
@@ -462,8 +523,11 @@ def main():
                 system = PerformanceBasedSystem()
                 results, predictor = system.analyze_race_performance(df, race_type)
                 
-                # Affichage des résultats
-                display_performance_results(results, df)
+                if results is not None:
+                    # Affichage des résultats
+                    display_performance_results(results, system)
+                else:
+                    st.error("❌ L'analyse a échoué")
                 
             except Exception as e:
                 st.error(f"❌ Erreur lors de l'analyse: {str(e)}")
@@ -476,9 +540,12 @@ def main():
                 df_demo = generate_performance_demo_data(demo_runners)
                 system = PerformanceBasedSystem()
                 results, _ = system.analyze_race_performance(df_demo, "PLAT")
-                display_performance_results(results, df_demo)
+                if results is not None:
+                    display_performance_results(results, system)
+                else:
+                    st.error("❌ La démo a échoué")
 
-def display_performance_results(results, original_df):
+def display_performance_results(results, system):
     """Affiche les résultats de l'analyse de performance"""
     
     st.success(f"✅ Analyse terminée - {len(results)} chevaux analysés")
@@ -489,19 +556,28 @@ def display_performance_results(results, original_df):
     col1, col2, col3, col4 = st.columns(4)
     
     with col1:
-        top_perf = results['performance_score'].iloc[0]
+        top_perf = results['performance_score'].iloc[0] if len(results) > 0 else 0
         st.metric("🥇 Meilleure Performance", f"{top_perf:.3f}")
     
     with col2:
-        avg_consistency = results.get('consistency_score', 0.5).mean()
+        if 'consistency_score' in results.columns:
+            avg_consistency = results['consistency_score'].mean()
+        else:
+            avg_consistency = 0.5
         st.metric("📊 Régularité Moyenne", f"{avg_consistency:.2f}")
     
     with col3:
-        improving_trend = len(results[results.get('performance_trend', 0) > 0])
+        if 'performance_trend' in results.columns:
+            improving_trend = len(results[results['performance_trend'] > 0])
+        else:
+            improving_trend = 0
         st.metric("📈 En Progression", f"{improving_trend} chevaux")
     
     with col4:
-        optimal_draws = len(results[results.get('draw_advantage', 0) > 0.7])
+        if 'draw_advantage' in results.columns:
+            optimal_draws = len(results[results['draw_advantage'] > 0.7])
+        else:
+            optimal_draws = 0
         st.metric("🎯 Bonnes Positions", f"{optimal_draws} chevaux")
     
     # Tableau des résultats
@@ -540,19 +616,24 @@ def display_performance_results(results, original_df):
     with col2:
         st.write("**🎯 Facteurs de Performance**")
         
-        factors = {
-            'Performance Récente': results.get('recent_perf_score', 0.5).mean(),
-            'Régularité': results.get('consistency_score', 0.5).mean(),
-            'Position': results.get('draw_advantage', 0.5).mean(),
-            'Poids': results.get('weight_advantage', 0.5).mean()
-        }
+        factors = {}
+        if 'recent_perf_score' in results.columns:
+            factors['Performance Récente'] = results['recent_perf_score'].mean()
+        if 'consistency_score' in results.columns:
+            factors['Régularité'] = results['consistency_score'].mean()
+        if 'draw_advantage' in results.columns:
+            factors['Position'] = results['draw_advantage'].mean()
+        if 'weight_advantage' in results.columns:
+            factors['Poids'] = results['weight_advantage'].mean()
         
-        factors_df = pd.DataFrame({
-            'Facteur': list(factors.keys()),
-            'Score': list(factors.values())
-        })
-        
-        st.dataframe(factors_df, use_container_width=True)
+        if factors:
+            factors_df = pd.DataFrame({
+                'Facteur': list(factors.keys()),
+                'Score': list(factors.values())
+            })
+            st.dataframe(factors_df, use_container_width=True)
+        else:
+            st.write("Aucune donnée de facteurs disponible")
     
     # Recommendations
     st.subheader("💡 Recommendations Basées sur la Performance")
@@ -566,11 +647,12 @@ def display_performance_recommendations(results):
     
     for i, (_, horse) in enumerate(top3.iterrows()):
         perf_score = horse['performance_score']
-        trend = horse.get('performance_trend', 0)
         
         col1, col2, col3 = st.columns([3, 1, 1])
         with col1:
-            trend_emoji = "📈" if trend > 0 else "📉" if trend < 0 else "➡️"
+            # Analyser la tendance pour l'emoji
+            perf_data = system.analyzer.analyze_musique(horse['Musique'])
+            trend_emoji = "📈" if perf_data['trend'] == 'improving' else "📉" if perf_data['trend'] == 'declining' else "➡️"
             st.write(f"{i+1}. **{horse['Nom']}** {trend_emoji}")
         with col2:
             st.write(f"`{perf_score:.3f}`")
@@ -579,18 +661,21 @@ def display_performance_recommendations(results):
     
     # Chevaux en progression
     st.success("**🚀 CHEVAUX EN PROGRESSION:**")
-    improving = results[results.get('performance_trend', 0) > 0.3].head(3)
     
-    if len(improving) > 0:
-        for _, horse in improving.iterrows():
-            if horse['rank'] > 3:  # Éviter les doublons
-                st.write(f"• **{horse['Nom']}** - Score: `{horse['performance_score']:.3f}`")
+    improving_horses = []
+    for _, horse in results.iterrows():
+        perf_data = system.analyzer.analyze_musique(horse['Musique'])
+        if perf_data['trend'] == 'improving' and horse['rank'] > 3:
+            improving_horses.append((horse, perf_data))
+    
+    if improving_horses:
+        for horse, perf_data in improving_horses[:3]:  # Limiter à 3
+            st.write(f"• **{horse['Nom']}** - Score: `{horse['performance_score']:.3f}`")
     else:
         st.write("Aucun cheval en progression significative détecté")
     
     # Stratégie
     st.warning("**🎲 STRATÉGIE RECOMMANDÉE:**")
-    n_runners = len(results)
     
     st.write("**Basée uniquement sur les performances:**")
     st.write("- Privilégiez les chevaux avec des **musiques régulières**")
@@ -615,7 +700,7 @@ def extract_race_data(url):
             rows = table.find_all('tr')[1:]
             for row in rows:
                 cols = row.find_all('td')
-                if len(cols) >= 6:
+                if len(cols) >= 4:  # Réduit le minimum requis
                     horse = extract_horse_data(cols)
                     if horse:
                         horses_data.append(horse)
@@ -624,7 +709,8 @@ def extract_race_data(url):
                 
         return pd.DataFrame(horses_data) if horses_data else generate_performance_demo_data(12)
         
-    except Exception:
+    except Exception as e:
+        st.warning(f"⚠️ Utilisation des données de démo: {e}")
         return generate_performance_demo_data(12)
 
 def extract_horse_data(cols):
@@ -640,7 +726,7 @@ def extract_horse_data(cols):
             if i == 0 and text.isdigit():
                 horse_data['Numéro de corde'] = text
             elif re.match(r'^\d+[.,]\d+$', text):
-                horse_data['Cote'] = text  # Stocké mais non utilisé dans l'analyse
+                horse_data['Cote'] = text  # Stocké mais non utilisé
             elif re.match(r'^\d+[.,]?\d*\s*(kg|KG)?$', text) and 'Poids' not in horse_data:
                 horse_data['Poids'] = text
             elif len(text) > 2 and len(text) < 25 and 'Nom' not in horse_data:
@@ -654,7 +740,8 @@ def extract_horse_data(cols):
             elif 'Entraîneur' not in horse_data and len(text) > 3:
                 horse_data['Entraîneur'] = text
         
-        if all(k in horse_data for k in ['Nom', 'Musique', 'Numéro de corde']):
+        # Validation minimale
+        if 'Nom' in horse_data and 'Musique' in horse_data and 'Numéro de corde' in horse_data:
             horse_data.setdefault('Poids', '60.0')
             horse_data.setdefault('Âge/Sexe', '5H')
             horse_data.setdefault('Jockey', 'Inconnu')
@@ -700,7 +787,7 @@ def generate_performance_demo_data(n_runners):
     
     return pd.DataFrame(data)
 
-# Initialisation du système
+# Initialisation du système global
 system = PerformanceBasedSystem()
 
 if __name__ == "__main__":
